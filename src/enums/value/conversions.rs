@@ -32,7 +32,7 @@ use std::sync::Arc;
 use crate::{SuperArray, SuperTable};
 
 #[cfg(feature = "views")]
-use crate::{ArrayV, BitmaskV, NumericArrayV, TableV, TextArrayV};
+use crate::{ArrayV, BitmaskV, BooleanArrayV, NumericArrayV, TableV, TextArrayV};
 
 #[cfg(all(feature = "views", feature = "datetime"))]
 use crate::TemporalArrayV;
@@ -638,6 +638,96 @@ impl_value_from!(Scalar: Scalar);
 #[cfg(feature = "scalar_type")]
 impl_tryfrom_value!(Scalar: Scalar);
 
+// Primitive numerics -> Value (wrap as Value::Scalar).
+
+#[cfg(feature = "scalar_type")]
+impl From<f64> for Value {
+    #[inline]
+    fn from(v: f64) -> Self {
+        Value::Scalar(Scalar::Float64(v))
+    }
+}
+
+#[cfg(feature = "scalar_type")]
+impl From<f32> for Value {
+    #[inline]
+    fn from(v: f32) -> Self {
+        Value::Scalar(Scalar::Float32(v))
+    }
+}
+
+#[cfg(feature = "scalar_type")]
+impl From<i64> for Value {
+    #[inline]
+    fn from(v: i64) -> Self {
+        Value::Scalar(Scalar::Int64(v))
+    }
+}
+
+#[cfg(feature = "scalar_type")]
+impl From<i32> for Value {
+    #[inline]
+    fn from(v: i32) -> Self {
+        Value::Scalar(Scalar::Int32(v))
+    }
+}
+
+#[cfg(feature = "scalar_type")]
+impl From<u64> for Value {
+    #[inline]
+    fn from(v: u64) -> Self {
+        Value::Scalar(Scalar::UInt64(v))
+    }
+}
+
+#[cfg(feature = "scalar_type")]
+impl From<u32> for Value {
+    #[inline]
+    fn from(v: u32) -> Self {
+        Value::Scalar(Scalar::UInt32(v))
+    }
+}
+
+#[cfg(feature = "scalar_type")]
+impl From<bool> for Value {
+    #[inline]
+    fn from(v: bool) -> Self {
+        Value::Scalar(Scalar::Boolean(v))
+    }
+}
+
+#[cfg(all(feature = "scalar_type", feature = "extended_numeric_types"))]
+impl From<i8> for Value {
+    #[inline]
+    fn from(v: i8) -> Self {
+        Value::Scalar(Scalar::Int8(v))
+    }
+}
+
+#[cfg(all(feature = "scalar_type", feature = "extended_numeric_types"))]
+impl From<i16> for Value {
+    #[inline]
+    fn from(v: i16) -> Self {
+        Value::Scalar(Scalar::Int16(v))
+    }
+}
+
+#[cfg(all(feature = "scalar_type", feature = "extended_numeric_types"))]
+impl From<u8> for Value {
+    #[inline]
+    fn from(v: u8) -> Self {
+        Value::Scalar(Scalar::UInt8(v))
+    }
+}
+
+#[cfg(all(feature = "scalar_type", feature = "extended_numeric_types"))]
+impl From<u16> for Value {
+    #[inline]
+    fn from(v: u16) -> Self {
+        Value::Scalar(Scalar::UInt16(v))
+    }
+}
+
 // TryFrom<Value> for primitive numeric types
 //
 // Enables DataStream<T>::collect() -> Result<T, BlockError> for numeric types.
@@ -803,6 +893,71 @@ impl From<Matrix> for Value {
     }
 }
 
+/// Wrap a `NumericArrayV` as `Value::ArrayView`. The view's offset and length
+/// are preserved; the inner `NumericArray` flows through `Array::NumericArray`.
+#[cfg(feature = "views")]
+impl From<NumericArrayV> for Value {
+    #[inline]
+    fn from(v: NumericArrayV) -> Self {
+        let len = v.len();
+        let array = Array::NumericArray(v.array);
+        Value::ArrayView(Arc::new(ArrayV::new(array, v.offset, len)))
+    }
+}
+
+/// Wrap a `TextArrayV` as `Value::ArrayView`. The view's offset and length
+/// are preserved; the inner `TextArray` flows through `Array::TextArray`.
+#[cfg(feature = "views")]
+impl From<TextArrayV> for Value {
+    #[inline]
+    fn from(v: TextArrayV) -> Self {
+        let len = v.len();
+        let array = Array::TextArray(v.array);
+        Value::ArrayView(Arc::new(ArrayV::new(array, v.offset, len)))
+    }
+}
+
+/// Wrap a `TemporalArrayV` as `Value::ArrayView`. The view's offset and length
+/// are preserved; the inner `TemporalArray` flows through `Array::TemporalArray`.
+#[cfg(all(feature = "views", feature = "datetime"))]
+impl From<TemporalArrayV> for Value {
+    #[inline]
+    fn from(v: TemporalArrayV) -> Self {
+        let len = v.len();
+        let array = Array::TemporalArray(v.array);
+        Value::ArrayView(Arc::new(ArrayV::new(array, v.offset, len)))
+    }
+}
+
+/// Wrap a `BitmaskV` as `Value::ArrayView` of a `BooleanArray`. The bitmask
+/// data is taken as the BooleanArray's data; `null_mask` is `None` since
+/// `BitmaskV` carries no separate validity.
+#[cfg(feature = "views")]
+impl From<BitmaskV> for Value {
+    #[inline]
+    fn from(v: BitmaskV) -> Self {
+        let len = v.len();
+        let bitmask = Arc::try_unwrap(v.bitmask).unwrap_or_else(|arc| (*arc).clone());
+        let bool_arr = crate::BooleanArray::new(bitmask, None);
+        let array = Array::BooleanArray(Arc::new(bool_arr));
+        Value::ArrayView(Arc::new(ArrayV::new(array, v.offset, len)))
+    }
+}
+
+/// Wrap a `BooleanArrayV` as `Value::ArrayView`. The view's offset and length
+/// are preserved on the inner `ArrayV`. The full null mask carried by the
+/// underlying `BooleanArray` is preserved.
+#[cfg(feature = "views")]
+impl From<BooleanArrayV> for Value {
+    #[inline]
+    fn from(v: BooleanArrayV) -> Self {
+        let len = v.len();
+        let bool_arr = Arc::try_unwrap(v.array).unwrap_or_else(|arc| (*arc).clone());
+        let array = Array::BooleanArray(Arc::new(bool_arr));
+        Value::ArrayView(Arc::new(ArrayV::new(array, v.offset, len)))
+    }
+}
+
 // TryFrom for Array-like Types
 
 impl TryFrom<Value> for Array {
@@ -861,6 +1016,10 @@ impl TryFrom<Value> for ArrayV {
         match v {
             Value::ArrayView(inner) => {
                 Ok(Arc::try_unwrap(inner).unwrap_or_else(|arc| (*arc).clone()))
+            }
+            Value::Array(inner) => {
+                let array = Arc::try_unwrap(inner).unwrap_or_else(|arc| (*arc).clone());
+                Ok(ArrayV::from(array))
             }
             _ => Err(MinarrowError::TypeError {
                 from: "Value",
@@ -928,6 +1087,20 @@ impl TryFrom<Value> for TextArrayV {
                     }),
                 }
             }
+            Value::Array(inner) => {
+                let array = Arc::try_unwrap(inner).unwrap_or_else(|arc| (*arc).clone());
+                match array {
+                    Array::TextArray(text_arr) => {
+                        let len = text_arr.len();
+                        Ok(TextArrayV::new(text_arr, 0, len))
+                    }
+                    _ => Err(MinarrowError::TypeError {
+                        from: "Value",
+                        to: "TextArrayV",
+                        message: Some("Array is not a TextArray".to_owned()),
+                    }),
+                }
+            }
             _ => Err(MinarrowError::TypeError {
                 from: "Value",
                 to: "TextArrayV",
@@ -953,6 +1126,20 @@ impl TryFrom<Value> for TemporalArrayV {
                         from: "Value",
                         to: "TemporalArrayV",
                         message: Some("ArrayV is not a TemporalArray".to_owned()),
+                    }),
+                }
+            }
+            Value::Array(inner) => {
+                let array = Arc::try_unwrap(inner).unwrap_or_else(|arc| (*arc).clone());
+                match array {
+                    Array::TemporalArray(temp_arr) => {
+                        let len = temp_arr.len();
+                        Ok(TemporalArrayV::new(temp_arr, 0, len))
+                    }
+                    _ => Err(MinarrowError::TypeError {
+                        from: "Value",
+                        to: "TemporalArrayV",
+                        message: Some("Array is not a TemporalArray".to_owned()),
                     }),
                 }
             }
@@ -1000,6 +1187,48 @@ impl TryFrom<Value> for BitmaskV {
             _ => Err(MinarrowError::TypeError {
                 from: "Value",
                 to: "BitmaskV",
+                message: Some("Value type mismatch".to_owned()),
+            }),
+        }
+    }
+}
+
+#[cfg(feature = "views")]
+impl TryFrom<Value> for BooleanArrayV {
+    type Error = MinarrowError;
+    fn try_from(v: Value) -> Result<Self, Self::Error> {
+        match v {
+            Value::ArrayView(inner) => {
+                let view = Arc::try_unwrap(inner).unwrap_or_else(|arc| (*arc).clone());
+                let (array, offset, len) = view.as_tuple();
+                match array {
+                    Array::BooleanArray(bool_arr) => {
+                        Ok(BooleanArrayV::new(bool_arr, offset, len))
+                    }
+                    _ => Err(MinarrowError::TypeError {
+                        from: "Value",
+                        to: "BooleanArrayV",
+                        message: Some("ArrayV is not a BooleanArray".to_owned()),
+                    }),
+                }
+            }
+            Value::Array(inner) => {
+                let array = Arc::try_unwrap(inner).unwrap_or_else(|arc| (*arc).clone());
+                match array {
+                    Array::BooleanArray(bool_arr) => {
+                        let len = bool_arr.len();
+                        Ok(BooleanArrayV::new(bool_arr, 0, len))
+                    }
+                    _ => Err(MinarrowError::TypeError {
+                        from: "Value",
+                        to: "BooleanArrayV",
+                        message: Some("Array is not a BooleanArray".to_owned()),
+                    }),
+                }
+            }
+            _ => Err(MinarrowError::TypeError {
+                from: "Value",
+                to: "BooleanArrayV",
                 message: Some("Value type mismatch".to_owned()),
             }),
         }
@@ -1080,6 +1309,10 @@ impl TryFrom<Value> for TableV {
         match v {
             Value::TableView(inner) => {
                 Ok(Arc::try_unwrap(inner).unwrap_or_else(|arc| (*arc).clone()))
+            }
+            Value::Table(inner) => {
+                let table = Arc::try_unwrap(inner).unwrap_or_else(|arc| (*arc).clone());
+                Ok(TableV::from(table))
             }
             _ => Err(MinarrowError::TypeError {
                 from: "Value",
@@ -1187,6 +1420,23 @@ impl TryFrom<Value> for Matrix {
             _ => Err(MinarrowError::TypeError {
                 from: "Value",
                 to: "Matrix",
+                message: Some("Value type mismatch".to_owned()),
+            }),
+        }
+    }
+}
+
+#[cfg(all(feature = "chunked", feature = "views"))]
+impl TryFrom<Value> for SuperTableV {
+    type Error = MinarrowError;
+    fn try_from(v: Value) -> Result<Self, Self::Error> {
+        match v {
+            Value::SuperTableView(inner) => {
+                Ok(Arc::try_unwrap(inner).unwrap_or_else(|arc| (*arc).clone()))
+            }
+            _ => Err(MinarrowError::TypeError {
+                from: "Value",
+                to: "SuperTableV",
                 message: Some("Value type mismatch".to_owned()),
             }),
         }

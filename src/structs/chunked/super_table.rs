@@ -645,6 +645,16 @@ impl FromIterator<Table> for SuperTable {
     }
 }
 
+impl From<SuperTable> for Vec<Table> {
+    fn from(super_table: SuperTable) -> Self {
+        super_table
+            .batches
+            .into_iter()
+            .map(|arc| Arc::try_unwrap(arc).unwrap_or_else(|a| (*a).clone()))
+            .collect()
+    }
+}
+
 impl Shape for SuperTable {
     fn shape(&self) -> ShapeDim {
         ShapeDim::Rank2 {
