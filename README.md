@@ -2,13 +2,13 @@
 
 **A fast, minimal columnar data library for Rust with Arrow compatibility.**
 
-Minarrow gives you typed columnar arrays that compile in 1.5 seconds, run with SIMD alignment, and convert to Arrow when you need interop. No trait object downcasting, no 200+ transitive dependencies, no waiting for builds.
+Minarrow gives you typed columnar arrays that compile in ~1.5 seconds, run with SIMD alignment, and convert to Arrow when you need interop. It keeps the common path concrete and lightweight, so iteration stays fast.
 
 ## Why Minarrow?
 
-**The problem:** Arrow-rs is powerful but heavy. Build times stretch to minutes. Working with arrays means downcasting `dyn Array` and hoping you got the type right. For real-time systems, embedded devices, or rapid iteration, this friction adds up.
+**The gap:** Arrow-rs is powerful but heavy. Build times can stretch to minutes, which matters when it becomes a base dependency for other systems. Working with arrays often means handling them through `dyn Array`, where the concrete backing vector is hidden behind the trait object. You downcast to recover the type before the data becomes ergonomic again. For real-time systems, embedded devices, or rapid iteration, that friction adds up.
 
-**The solution:** Minarrow keeps concrete types throughout. An `IntegerArray<i64>` stays an `IntegerArray<i64>`. You get direct access, IDE autocomplete, and fast compilation. When you need to talk to Arrow, Polars, or PyArrow, zero-copy conversion is one method call away.
+**The solution:** Minarrow keeps concrete types throughout. An `IntegerArray<i64>` stays fully typed through composable abstractions. You get direct access, ergonomics, IDE autocomplete, and fast compilation. When you need to talk to Arrow, Polars, or PyArrow, zero-copy conversion is one method call away.
 
 ## Quick Start
 
