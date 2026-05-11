@@ -140,6 +140,26 @@ impl<T: Integer> CategoricalArray<T> {
         }
     }
 
+    /// Construct an empty categorical with reserved capacity for `cap` indices.
+    /// Pass `unique_values` to pre-populate the dictionary, or `None` for an
+    /// empty one.
+    #[inline]
+    pub fn with_capacity(
+        cap: usize,
+        unique_values: Option<Vec64<String>>,
+        null_mask: bool,
+    ) -> Self {
+        Self {
+            data: Vec64::with_capacity(cap).into(),
+            unique_values: unique_values.unwrap_or_default(),
+            null_mask: if null_mask {
+                Some(Bitmask::with_capacity(cap))
+            } else {
+                None
+            },
+        }
+    }
+
     /// Build a categorical column from raw string values, auto-deriving the dictionary.
     #[inline]
     pub fn from_vec64(values: Vec64<&str>, null_mask: Option<Bitmask>) -> Self {
