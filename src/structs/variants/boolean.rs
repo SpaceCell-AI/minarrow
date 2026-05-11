@@ -112,10 +112,44 @@ pub struct BooleanArray<T> {
     pub data: Bitmask,
     /// Optional null mask (bit-packed; 1=valid, 0=null).
     pub null_mask: Option<Bitmask>,
-    /// Number of elements.
+    /// Number of logically populated bits.
+    ///
+    /// For an owned BooleanArray this is the canonical element count - it
+    /// can be less than `data.len()` when the underlying [`Bitmask`] was
+    /// created with reserved capacity (e.g. via `with_capacity`). For an
+    /// LBuffer-backed BooleanArray the live count is the underlying
+    /// Bitmask's published bit count, read via [`len`](Self::len). The
+    /// field is private under the `lbuffer` feature so callers go through
+    /// the method and observe the live value.
+    #[cfg(not(feature = "lbuffer"))]
     pub len: usize,
+    #[cfg(feature = "lbuffer")]
+    pub(crate) len: usize,
 
     pub _phantom: PhantomData<T>,
+}
+
+impl<T> BooleanArray<T> {
+    /// Number of logically populated elements.
+    ///
+    /// For an LBuffer-backed BooleanArray this returns the underlying
+    /// Bitmask's currently published bit count. For an owned array this
+    /// returns the stored populated-bit count, which can be less than
+    /// `data.len()` after `with_capacity`.
+    #[inline]
+    pub fn len(&self) -> usize {
+        #[cfg(feature = "lbuffer")]
+        if self.data.bits.lbuffer_mask_state().is_some() {
+            return self.data.len();
+        }
+        self.len
+    }
+
+    /// Returns true if the array has no logically populated elements.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 impl BooleanArray<()> {
@@ -367,6 +401,14 @@ impl MaskedArray for BooleanArray<()> {
     }
 
     fn len(&self) -> usize {
+        // For an LBuffer-backed BooleanArray the live element count is the
+        // underlying Bitmask's published bit count. For an owned array the
+        // stored `self.len` is the canonical populated-bit count, which can
+        // differ from `data.len()` after `with_capacity`.
+        #[cfg(feature = "lbuffer")]
+        if self.data.bits.lbuffer_mask_state().is_some() {
+            return self.data.len();
+        }
         self.len
     }
 

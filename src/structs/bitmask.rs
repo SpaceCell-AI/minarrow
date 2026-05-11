@@ -34,6 +34,10 @@ use std::ops::{BitAnd, BitOr, Deref, DerefMut, Index, Not};
 use crate::enums::shape_dim::ShapeDim;
 use crate::traits::concatenate::Concatenate;
 use crate::traits::shape::Shape;
+#[cfg(feature = "lbuffer")]
+use crate::structs::lbuffer::LBufferV;
+#[cfg(feature = "lbuffer")]
+use std::sync::atomic::{AtomicU8, Ordering};
 use crate::{BitmaskV, Buffer, Length, Offset};
 use vec64::Vec64;
 
@@ -67,7 +71,16 @@ use vec64::Vec64;
 #[derive(Clone, PartialEq, Default)]
 pub struct Bitmask {
     pub bits: Buffer<u8>,
+    /// Owned bit count.
+    ///
+    /// For an LBuffer-backed bitmask this stays at 0; the live published bit
+    /// count is read via [`len`](Self::len) (which routes through
+    /// [`llen`](Self::llen)). The field is private under the `lbuffer`
+    /// feature so callers go through the method and observe the live value.
+    #[cfg(not(feature = "lbuffer"))]
     pub len: usize,
+    #[cfg(feature = "lbuffer")]
+    len: usize,
 }
 
 impl Bitmask {
@@ -122,6 +135,18 @@ impl Bitmask {
         mask
     }
 
+    /// Wrap a validity view from an [`crate::LBuffer`], sharing its bytes and
+    /// trailing partial byte. Length and bits are read through the view; the
+    /// stored `len` is the owned bit count, zero here.
+    #[cfg(feature = "lbuffer")]
+    #[inline]
+    pub fn from_lbuffer(view: LBufferV<u8>) -> Self {
+        Self {
+            bits: Buffer::from_lbuffer(view),
+            len: 0,
+        }
+    }
+
     /// Create a Bitmask from a raw pointer to a bit-packed buffer.
     ///
     /// - `ptr`: Pointer to a packed `[u8]` (as per Arrow and C FFI).
@@ -166,26 +191,46 @@ impl Bitmask {
     /// Returns the logical length of the bitmask
     ///
     /// *Excludes padding*
+    #[cfg(not(feature = "lbuffer"))]
     #[inline]
     pub fn len(&self) -> usize {
         self.len
     }
 
+    /// Returns the logical length of the bitmask, following the LBuffer
+    /// backing when present.
+    ///
+    /// *Excludes padding*
+    #[cfg(feature = "lbuffer")]
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.llen()
+    }
+
+    /// Logical length following the LBuffer backing. For an LBuffer-backed
+    /// mask this returns the producer's currently published bit count;
+    /// otherwise the stored length.
+    #[cfg(feature = "lbuffer")]
+    #[inline]
+    pub fn llen(&self) -> usize {
+        self.bits.lbuffer_mask_bits().unwrap_or(self.len)
+    }
+
     /// Return logical number of bits (slots).
     #[inline]
     pub fn capacity(&self) -> usize {
-        self.len
+        self.len()
     }
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.len() == 0
     }
 
     /// Returns true if all bits set (i.e. valid for null-mask).
     #[inline]
     pub fn all_set(&self) -> bool {
-        self.count_ones() == self.len
+        self.count_ones() == self.len()
     }
 
     /// Returns true if all bits cleared.
@@ -204,6 +249,30 @@ impl Bitmask {
     /// Always creates a fresh owned copy, even if already owned.
     #[inline]
     pub fn to_owned_copy(&self) -> Self {
+        // Copy the settled bytes plus the byte being filled into an owned
+        // contiguous buffer.
+        #[cfg(feature = "lbuffer")]
+        if let Some((base, settled, filled, _)) = self.bits.lbuffer_mask_state() {
+            let bit_len = settled * 8 + filled;
+            let mut data = Vec64::<u8>::with_capacity((bit_len + 7) / 8);
+            for b in 0..settled {
+                // SAFETY: b < settled, within the allocation and frozen.
+                data.push(unsafe { *base.add(b) });
+            }
+            if filled > 0 {
+                // SAFETY: `settled` indexes the byte being filled, within the
+                // allocation; read atomically to match the producer's writes.
+                data.push(unsafe {
+                    AtomicU8::from_ptr(base.add(settled) as *mut u8).load(Ordering::Relaxed)
+                });
+            }
+            let mut mask = Bitmask {
+                bits: data.into(),
+                len: bit_len,
+            };
+            mask.mask_trailing_bits();
+            return mask;
+        }
         let owned_bits = self.bits.to_owned_copy();
         Bitmask {
             bits: owned_bits,
@@ -216,6 +285,27 @@ impl Bitmask {
     /// Panics only when `idx` exceeds the physical capacity.
     #[inline]
     pub fn get(&self, idx: usize) -> bool {
+        // Settled byte read plain; the byte being filled read atomically.
+        #[cfg(feature = "lbuffer")]
+        if let Some((base, settled, filled, _)) = self.bits.lbuffer_mask_state() {
+            if idx >= settled * 8 + filled {
+                return false;
+            }
+            let byte_idx = idx >> 3;
+            let byte = if byte_idx < settled {
+                // SAFETY: byte_idx < settled, so it is within the allocation and
+                // frozen (a settled byte is never written again); a plain read
+                // is ordered after the producer's writes by the Acquire in
+                // mask_state, so it races nothing.
+                unsafe { *base.add(byte_idx) }
+            } else {
+                // SAFETY: byte_idx == settled is the byte being filled, within
+                // the allocation; the producer writes it atomically, so read it
+                // atomically.
+                unsafe { AtomicU8::from_ptr(base.add(byte_idx) as *mut u8).load(Ordering::Relaxed) }
+            };
+            return (byte >> (idx & 7)) & 1 != 0;
+        }
         let cap_bits = self.bits.len() * 8;
         assert!(
             idx < cap_bits,
@@ -358,6 +448,10 @@ impl Bitmask {
     /// Returns true if all bits are set (all valid).
     #[inline]
     pub fn all_true(&self) -> bool {
+        #[cfg(feature = "lbuffer")]
+        if self.bits.lbuffer_mask_state().is_some() {
+            return self.count_ones() == self.len();
+        }
         if self.len == 0 {
             return true;
         }
@@ -377,6 +471,10 @@ impl Bitmask {
     /// Returns true if all bits are cleared (all null).
     #[inline]
     pub fn all_false(&self) -> bool {
+        #[cfg(feature = "lbuffer")]
+        if self.bits.lbuffer_mask_state().is_some() {
+            return self.count_ones() == 0;
+        }
         if self.len == 0 {
             return true;
         }
@@ -416,13 +514,17 @@ impl Bitmask {
     /// Returns true if there are any cleared bits (any nulls).
     #[inline]
     pub fn has_nulls(&self) -> bool {
+        #[cfg(feature = "lbuffer")]
+        if self.bits.lbuffer_mask_state().is_some() {
+            return self.count_zeros() > 0;
+        }
         !self.all_true()
     }
 
     /// Returns the pointer to the start of the mask.
     #[inline]
     pub fn as_ptr(&self) -> *const u8 {
-        self.bits.as_ptr()
+        self.as_slice().as_ptr()
     }
 
     /// Set bit at index to true
@@ -440,6 +542,24 @@ impl Bitmask {
     /// Count number of set (1) bits.
     #[inline]
     pub fn count_ones(&self) -> usize {
+        // Popcount the settled bytes and the filled bits of the last byte.
+        #[cfg(feature = "lbuffer")]
+        if let Some((base, settled, filled, _)) = self.bits.lbuffer_mask_state() {
+            let mut ones = 0usize;
+            for b in 0..settled {
+                // SAFETY: b < settled, within the allocation and frozen.
+                ones += unsafe { *base.add(b) }.count_ones() as usize;
+            }
+            if filled > 0 {
+                // SAFETY: `settled` indexes the byte being filled, within the
+                // allocation; read atomically to match the producer's writes.
+                let byte =
+                    unsafe { AtomicU8::from_ptr(base.add(settled) as *mut u8).load(Ordering::Relaxed) };
+                let mask = ((1u16 << filled) - 1) as u8;
+                ones += (byte & mask).count_ones() as usize;
+            }
+            return ones;
+        }
         let full_bytes = self.len / 8;
         let mut count = self.bits[..full_bytes]
             .iter()
@@ -456,7 +576,7 @@ impl Bitmask {
     /// Count number of cleared (0) bits.
     #[inline]
     pub fn count_zeros(&self) -> usize {
-        self.len - self.count_ones()
+        self.len() - self.count_ones()
     }
 
     /// Returns the number of bits set to false.
@@ -661,9 +781,21 @@ impl Bitmask {
         self.mask_trailing_bits();
     }
 
-    /// Returns the entire underlying byte slice representing the packed bitmask.
+    /// Returns the packed byte slice of the bitmask.
+    ///
+    /// For an LBuffer-backed mask this is the settled bytes; the byte still
+    /// being filled joins them once the producer seals.
     #[inline]
     pub fn as_slice(&self) -> &[u8] {
+        #[cfg(feature = "lbuffer")]
+        if let Some((base, settled, filled, sealed)) = self.bits.lbuffer_mask_state() {
+            let n = if sealed && filled > 0 { settled + 1 } else { settled };
+            // SAFETY: those `n` bytes are within the allocation and frozen - the
+            // settled bytes always, and the last byte too once sealed (the
+            // producer has stopped). `base` stays valid while `self` holds the
+            // backing Arc, so the slice borrow is sound for `&self`.
+            return unsafe { std::slice::from_raw_parts(base, n) };
+        }
         self.bits.as_slice()
     }
 
@@ -763,34 +895,12 @@ impl Bitmask {
 
     /// Iterator over all indices with set bits (valid).
     pub fn iter_set(&self) -> impl Iterator<Item = usize> + '_ {
-        let n = self.len;
-        self.bits.iter().enumerate().flat_map(move |(byte_i, &b)| {
-            let base = byte_i * 8;
-            (0..8).filter_map(move |bit| {
-                let idx = base + bit;
-                if idx < n && ((b >> bit) & 1) != 0 {
-                    Some(idx)
-                } else {
-                    None
-                }
-            })
-        })
+        (0..self.len()).filter(move |&i| self.get(i))
     }
 
     /// Iterator over all indices with cleared bits (nulls).
     pub fn iter_cleared(&self) -> impl Iterator<Item = usize> + '_ {
-        let n = self.len;
-        self.bits.iter().enumerate().flat_map(move |(byte_i, &b)| {
-            let base = byte_i * 8;
-            (0..8).filter_map(move |bit| {
-                let idx = base + bit;
-                if idx < n && ((b >> bit) & 1) == 0 {
-                    Some(idx)
-                } else {
-                    None
-                }
-            })
-        })
+        (0..self.len()).filter(move |&i| !self.get(i))
     }
 
     /// Set all bits to set/cleared.
@@ -806,20 +916,31 @@ impl Bitmask {
     /// Returns raw (bitpacked) buffer slice
     #[inline]
     pub fn buffer(&self) -> &[u8] {
-        &self.bits
+        self.as_slice()
     }
 
     /// Fast bit access with no bounds checking. Caller guarantees idx < self.len.
     //#[cfg(feature = "unchecked")]
     #[inline(always)]
     pub unsafe fn get_unchecked(&self, idx: usize) -> bool {
-        let byte = unsafe { self.bits.get_unchecked(idx >> 3) };
-        ((*byte) >> (idx & 7)) & 1 != 0
+        let byte = unsafe { self.get_unchecked_byte(idx >> 3) };
+        (byte >> (idx & 7)) & 1 != 0
     }
 
     /// Returns the byte at `byte_idx` with no bounds checking.
     #[inline(always)]
     pub unsafe fn get_unchecked_byte(&self, byte_idx: usize) -> u8 {
+        // Settled byte read plain; the byte being filled read atomically.
+        #[cfg(feature = "lbuffer")]
+        if let Some((base, settled, _filled, _)) = self.bits.lbuffer_mask_state() {
+            return if byte_idx < settled {
+                // SAFETY: byte_idx < settled, within the allocation and frozen.
+                unsafe { *base.add(byte_idx) }
+            } else {
+                // SAFETY: the byte being filled, within the allocation; read atomically.
+                unsafe { AtomicU8::from_ptr(base.add(byte_idx) as *mut u8).load(Ordering::Relaxed) }
+            };
+        }
         *unsafe { self.bits.get_unchecked(byte_idx) }
     }
 }
@@ -834,7 +955,7 @@ mod parallel {
         /// Parallel iterator over every bit in `[0, len)`.
         #[inline]
         pub fn par_iter(&self) -> impl ParallelIterator<Item = bool> + '_ {
-            (0..self.len)
+            (0..self.len())
                 .into_par_iter()
                 .map(move |i| unsafe { self.get_unchecked(i) })
         }
@@ -846,7 +967,7 @@ mod parallel {
             start: usize,
             end: usize,
         ) -> impl ParallelIterator<Item = bool> + '_ {
-            debug_assert!(start <= end && end <= self.len);
+            debug_assert!(start <= end && end <= self.len());
             (start..end)
                 .into_par_iter()
                 .map(move |i| unsafe { self.get_unchecked(i) })
@@ -870,7 +991,7 @@ impl Index<usize> for Bitmask {
 impl Debug for Bitmask {
     fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         f.debug_struct("Bitmask")
-            .field("len", &self.len)
+            .field("len", &self.len())
             .field("ones", &self.count_ones())
             .field("zeros", &self.count_zeros())
             .field("buffer", &self.bits)
@@ -912,7 +1033,7 @@ impl Not for Bitmask {
 impl AsRef<[u8]> for Bitmask {
     #[inline]
     fn as_ref(&self) -> &[u8] {
-        self.bits.as_ref()
+        self.as_slice()
     }
 }
 
@@ -928,7 +1049,7 @@ impl Deref for Bitmask {
 
     #[inline]
     fn deref(&self) -> &Self::Target {
-        self.bits.as_ref()
+        self.as_slice()
     }
 }
 
@@ -941,18 +1062,15 @@ impl DerefMut for Bitmask {
 
 impl Display for Bitmask {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let len = self.len();
         let ones = self.count_ones();
         let zeros = self.count_zeros();
-        writeln!(
-            f,
-            "Bitmask [{} bits] (ones: {}, zeros: {})",
-            self.len, ones, zeros
-        )?;
+        writeln!(f, "Bitmask [{} bits] (ones: {}, zeros: {})", len, ones, zeros)?;
 
         const MAX_PREVIEW: usize = 64;
         write!(f, "[")?;
 
-        for i in 0..usize::min(self.len, MAX_PREVIEW) {
+        for i in 0..usize::min(len, MAX_PREVIEW) {
             if i > 0 {
                 write!(f, " ")?;
             }
@@ -967,8 +1085,8 @@ impl Display for Bitmask {
             )?;
         }
 
-        if self.len > MAX_PREVIEW {
-            write!(f, " … ({} total)", self.len)?;
+        if len > MAX_PREVIEW {
+            write!(f, " … ({} total)", len)?;
         }
 
         write!(f, "]")

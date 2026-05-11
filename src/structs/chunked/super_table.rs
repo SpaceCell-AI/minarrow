@@ -435,9 +435,18 @@ impl SuperTable {
             .collect()
     }
 
+    /// Number of rows across all batches.
+    #[cfg(not(feature = "lbuffer"))]
     #[inline]
     pub fn n_rows(&self) -> usize {
         self.n_rows
+    }
+
+    /// Number of rows across all batches.
+    #[cfg(feature = "lbuffer")]
+    #[inline]
+    pub fn n_rows(&self) -> usize {
+        self.batches.iter().map(|b| b.n_rows()).sum()
     }
 
     #[inline]
@@ -446,7 +455,7 @@ impl SuperTable {
     }
     #[inline]
     pub fn len(&self) -> usize {
-        self.n_rows
+        self.n_rows()
     }
     #[inline]
     pub fn is_empty(&self) -> bool {

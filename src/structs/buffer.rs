@@ -84,6 +84,8 @@ use std::{fmt, mem};
 use log::warn;
 
 use crate::Vec64;
+#[cfg(feature = "lbuffer")]
+use crate::structs::lbuffer::LBufferV;
 use crate::structs::shared_buffer::SharedBuffer;
 use crate::traits::print::MAX_PREVIEW;
 
@@ -135,6 +137,14 @@ enum Storage<T> {
         offset: usize, // element index (not bytes)
         len: usize,    // element count
     },
+    /// Re-fetching view over a producer-owned `LBuffer<T>`.
+    ///
+    /// Each access through this variant goes via the `LBufferV` handle, which
+    /// re-reads the backing's current base pointer. Survives reallocation of
+    /// the underlying `Vec64<T>` so consumers can hold the buffer while the
+    /// producer continues to grow its storage.
+    #[cfg(feature = "lbuffer")]
+    LBuffer(LBufferV<T>),
 }
 
 impl<T: Clone> Buffer<T> {
@@ -153,6 +163,19 @@ impl<T> Buffer<T> {
     pub fn from_vec64(v: Vec64<T>) -> Self {
         Self {
             storage: Storage::Owned(v),
+        }
+    }
+
+    /// Construct a buffer backed by an `LBufferV` view.
+    ///
+    /// Reads through the view re-fetch the producer's current backing base on
+    /// every access, so the buffer remains valid across reallocations of the
+    /// underlying `LBuffer`.
+    #[cfg(feature = "lbuffer")]
+    #[inline]
+    pub fn from_lbuffer(view: LBufferV<T>) -> Self {
+        Self {
+            storage: Storage::LBuffer(view),
         }
     }
 
@@ -414,6 +437,8 @@ impl<T> Buffer<T> {
         match &self.storage {
             Storage::Shared { owner, .. } => owner.memfd_fd(),
             Storage::Owned(_) => None,
+            #[cfg(feature = "lbuffer")]
+            Storage::LBuffer(_) => None,
         }
     }
 
@@ -428,6 +453,8 @@ impl<T> Buffer<T> {
                 let ptr = unsafe { bytes.as_ptr().add(offset * size_of_t) };
                 unsafe { std::slice::from_raw_parts(ptr as *const T, *len) }
             }
+            #[cfg(feature = "lbuffer")]
+            Storage::LBuffer(view) => view.as_slice(),
         }
     }
 
@@ -438,9 +465,56 @@ impl<T> Buffer<T> {
     }
 
     /// Returns the number of elements in the buffer.
+    #[cfg(not(feature = "lbuffer"))]
     #[inline]
     pub fn len(&self) -> usize {
         self.as_slice().len()
+    }
+
+    /// Returns the number of elements in the buffer.
+    #[cfg(feature = "lbuffer")]
+    #[inline]
+    pub fn len(&self) -> usize {
+        match &self.storage {
+            Storage::Owned(vec) => vec.len(),
+            Storage::Shared { len, .. } => *len,
+            // LBuffer-backed: follow llen().
+            Storage::LBuffer(_) => self.llen(),
+        }
+    }
+
+    /// Length following the LBuffer backing. Matches [`len`](Self::len) for
+    /// owned and shared storage. For an LBuffer-backed buffer it reads the
+    /// producer's currently published length, including the trailing validity
+    /// byte when the backing is a mask buffer.
+    #[cfg(feature = "lbuffer")]
+    #[inline]
+    pub fn llen(&self) -> usize {
+        match &self.storage {
+            Storage::Owned(vec) => vec.len(),
+            Storage::Shared { len, .. } => *len,
+            Storage::LBuffer(view) => view.len(),
+        }
+    }
+
+    /// A consistent read of the mask state when this buffer is LBuffer-backed
+    /// by a mask buffer; `None` otherwise. See [`LBufferV::mask_state`].
+    #[cfg(feature = "lbuffer")]
+    #[inline]
+    pub(crate) fn lbuffer_mask_state(&self) -> Option<(*const u8, usize, usize, bool)> {
+        match &self.storage {
+            Storage::LBuffer(view) => view.mask_state(),
+            _ => None,
+        }
+    }
+
+    /// Published bit count when this buffer is LBuffer-backed by a mask buffer;
+    /// `None` otherwise.
+    #[cfg(feature = "lbuffer")]
+    #[inline]
+    pub(crate) fn lbuffer_mask_bits(&self) -> Option<usize> {
+        let (_, settled, filled, _) = self.lbuffer_mask_state()?;
+        Some(settled * 8 + filled)
     }
 
     /// Returns true if the buffer is empty.
@@ -477,6 +551,13 @@ impl<T> Buffer<T> {
                 // Only the viewed slice is available, no reserve
                 *len
             }
+            #[cfg(feature = "lbuffer")]
+            Storage::LBuffer(view) => {
+                // The view exposes a fixed-size window over the producer's
+                // backing; capacity from the consumer's perspective is the
+                // window length.
+                view.len()
+            }
         }
     }
     /// Ensure owned and return &mut Vec64<T>.
@@ -487,23 +568,35 @@ impl<T> Buffer<T> {
             return vec;
         }
 
-        // We know it's Shared, so take it out by replacing with a dummy Owned.
+        // Take the non-owned variant out by replacing with a dummy Owned.
         // This doesn't borrow `self.storage` across the replacement.
-        let (owner, offset, len) =
-            match mem::replace(&mut self.storage, Storage::Owned(Vec64::with_capacity(0))) {
-                Storage::Shared { owner, offset, len } => (owner, offset, len),
-                _ => unreachable!(),
-            };
-
-        // Build a new Vec64<T> from the shared slice
-        let bytes = owner.as_slice();
-        let size_of_t = std::mem::size_of::<T>();
-        let ptr = unsafe { bytes.as_ptr().add(offset * size_of_t) };
-        let mut new_vec = Vec64::with_capacity(len);
-        unsafe {
-            std::ptr::copy_nonoverlapping(ptr as *const T, new_vec.as_mut_ptr(), len);
-            new_vec.set_len(len);
-        }
+        let new_vec = match mem::replace(&mut self.storage, Storage::Owned(Vec64::with_capacity(0)))
+        {
+            Storage::Shared { owner, offset, len } => {
+                // Build a new Vec64<T> from the shared slice
+                let bytes = owner.as_slice();
+                let size_of_t = std::mem::size_of::<T>();
+                let ptr = unsafe { bytes.as_ptr().add(offset * size_of_t) };
+                let mut v = Vec64::with_capacity(len);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(ptr as *const T, v.as_mut_ptr(), len);
+                    v.set_len(len);
+                }
+                v
+            }
+            #[cfg(feature = "lbuffer")]
+            Storage::LBuffer(view) => {
+                // Snapshot the view's current contents into an owned Vec64.
+                let src = view.as_slice();
+                let mut v = Vec64::with_capacity(src.len());
+                unsafe {
+                    std::ptr::copy_nonoverlapping(src.as_ptr(), v.as_mut_ptr(), src.len());
+                    v.set_len(src.len());
+                }
+                v
+            }
+            _ => unreachable!(),
+        };
 
         // Store it back as Owned
         self.storage = Storage::Owned(new_vec);
@@ -570,6 +663,20 @@ impl<T> Buffer<T> {
                 (shared, 0, len)
             }
             Storage::Shared { owner, offset, len } => (owner, offset, len),
+            #[cfg(feature = "lbuffer")]
+            Storage::LBuffer(view) => {
+                // Snapshot the view into a fresh Vec64 and freeze it.
+                // The producer's backing keeps growing independently.
+                let src = view.as_slice();
+                let mut v = Vec64::with_capacity(src.len());
+                unsafe {
+                    std::ptr::copy_nonoverlapping(src.as_ptr(), v.as_mut_ptr(), src.len());
+                    v.set_len(src.len());
+                }
+                let len = v.len();
+                let shared = unsafe { SharedBuffer::from_vec64_typed(v) };
+                (shared, 0, len)
+            }
         }
     }
 
@@ -583,6 +690,8 @@ impl<T> Buffer<T> {
         match &self.storage {
             Storage::Shared { owner, offset, len } => Some((owner, *offset, *len)),
             Storage::Owned(_) => None,
+            #[cfg(feature = "lbuffer")]
+            Storage::LBuffer(_) => None,
         }
     }
 }
@@ -614,6 +723,10 @@ impl<T: Clone> Buffer<T> {
             Storage::Shared { .. } => {
                 panic!("split_off is not supported on Shared buffers")
             }
+            #[cfg(feature = "lbuffer")]
+            Storage::LBuffer(_) => {
+                panic!("split_off is not supported on LBuffer-backed buffers")
+            }
         }
     }
 }
@@ -637,8 +750,12 @@ pub fn split_at_first_align64(ptr: *const u8, len_bytes: usize) -> Option<(usize
 impl<T: Copy> Buffer<T> {
     /// Shorten this buffer to at most `new_len` elements.
     ///
-    /// - If it's `Owned`, calls `Vec64::truncate`.
-    /// - If it's `Shared`, zero-copy SharedBuffer view.
+    /// - `Owned`: in-place `Vec64::truncate`.
+    /// - `Shared`: zero-copy adjustment of the captured length.
+    /// - `LBuffer`: copy-on-write into an owned `Vec64<T>` first, then
+    ///   truncate. The live-view variant has no captured length to
+    ///   shrink directly, so a downstream truncate detaches from the
+    ///   producer's still-growing storage.
     #[inline]
     pub fn truncate(&mut self, new_len: usize) {
         if new_len >= self.len() {
@@ -649,6 +766,8 @@ impl<T: Copy> Buffer<T> {
             Storage::Shared { offset: _, len, .. } => {
                 *len = new_len;
             }
+            #[cfg(feature = "lbuffer")]
+            Storage::LBuffer(_) => self.make_owned_mut().truncate(new_len),
         }
     }
 }
@@ -663,6 +782,10 @@ impl<T: Clone> Clone for Buffer<T> {
                     offset: *offset,
                     len: *len,
                 },
+            },
+            #[cfg(feature = "lbuffer")]
+            Storage::LBuffer(view) => Buffer {
+                storage: Storage::LBuffer(view.clone()),
             },
         }
     }
@@ -714,6 +837,10 @@ impl<T> DerefMut for Buffer<T> {
             Storage::Shared { .. } => {
                 // indexing via `&mut buf[0]` still panics
                 panic!("Cannot mutably deref a shared buffer")
+            }
+            #[cfg(feature = "lbuffer")]
+            Storage::LBuffer(_) => {
+                panic!("Cannot mutably deref an LBuffer-backed buffer")
             }
         }
     }
@@ -784,6 +911,14 @@ impl<T: Copy> IntoIterator for Buffer<T> {
                     v
                 };
                 drop(owner);
+                v.into_iter()
+            },
+            #[cfg(feature = "lbuffer")]
+            Storage::LBuffer(view) => {
+                let src = view.as_slice();
+                let mut v = Vec64::with_capacity(src.len());
+                unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), v.as_mut_ptr(), src.len()) };
+                unsafe { v.set_len(src.len()) };
                 v.into_iter()
             }
         }

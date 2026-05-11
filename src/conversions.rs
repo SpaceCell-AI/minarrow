@@ -324,8 +324,9 @@ macro_rules! bool_to_primitive_from {
         $(
             impl From<&BooleanArray<u8>> for IntegerArray<$ity> {
                 fn from(src: &BooleanArray<u8>) -> Self {
-                    let mut data = Vec64::with_capacity(src.len);
-                    for i in 0..src.len {
+                    let n = src.len();
+                    let mut data = Vec64::with_capacity(n);
+                    for i in 0..n {
                         data.push(if unsafe { src.data.get_unchecked(i) } { $one } else { $zero });
                     }
                     IntegerArray { data: data.into(), null_mask: src.null_mask.clone() }
@@ -335,8 +336,9 @@ macro_rules! bool_to_primitive_from {
         $(
             impl From<&BooleanArray<u8>> for FloatArray<$fty> {
                 fn from(src: &BooleanArray<u8>) -> Self {
-                    let mut data = Vec64::with_capacity(src.len);
-                    for i in 0..src.len {
+                    let n = src.len();
+                    let mut data = Vec64::with_capacity(n);
+                    for i in 0..n {
                         data.push(if unsafe { src.data.get_unchecked(i) } { $fone } else { $fzero });
                     }
                     FloatArray { data: data.into(), null_mask: src.null_mask.clone() }
@@ -458,11 +460,12 @@ numeric_to_string!(FloatArray<f64>);
 
 impl From<&BooleanArray<u8>> for StringArray<u32> {
     fn from(src: &BooleanArray<u8>) -> Self {
+        let n = src.len();
         let mut data = Vec64::new();
-        let mut offsets = Vec64::with_capacity(src.len + 1);
+        let mut offsets = Vec64::with_capacity(n + 1);
         let mut offset = 0u32;
         offsets.push(offset);
-        for i in 0..src.len {
+        for i in 0..n {
             let s = if unsafe { src.data.get_unchecked(i) } {
                 "1"
             } else {

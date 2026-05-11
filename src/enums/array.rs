@@ -581,8 +581,9 @@ impl Array {
             Array::BooleanArray(mut arr) => {
                 // If the Arc<BooleanArray> is not unique, clone here
                 let arr_mut = Arc::make_mut(&mut arr);
-                let mut out = Vec64::with_capacity(arr_mut.len);
-                for i in 0..arr_mut.len {
+                let n = arr_mut.len();
+                let mut out = Vec64::with_capacity(n);
+                for i in 0..n {
                     let v = match arr_mut.get(i) {
                         Some(true) => 1,
                         Some(false) => 0,
@@ -802,8 +803,9 @@ impl Array {
             Array::TextArray(arr) => arr,
 
             Array::BooleanArray(arr) => {
-                let mut strings: Vec<String> = Vec::with_capacity(arr.len);
-                for i in 0..arr.len {
+                let n = arr.len();
+                let mut strings: Vec<String> = Vec::with_capacity(n);
+                for i in 0..n {
                     match arr.get(i) {
                         Some(true) => strings.push("true".to_string()),
                         Some(false) => strings.push("false".to_string()),

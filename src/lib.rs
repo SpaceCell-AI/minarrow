@@ -174,6 +174,8 @@ pub mod structs {
     }
     pub mod bitmask;
     pub mod buffer;
+    #[cfg(feature = "lbuffer")]
+    pub mod lbuffer;
     pub mod column;
     #[cfg(feature = "shared_dict")]
     pub mod dictionary;
@@ -247,6 +249,8 @@ pub use enums::value::Value;
 pub use structs::arena::{AAMaker, Arena, ArenaRegion};
 pub use structs::bitmask::Bitmask;
 pub use structs::buffer::Buffer;
+#[cfg(feature = "lbuffer")]
+pub use structs::lbuffer::{LBuffer, LBufferV};
 #[cfg(feature = "chunked")]
 pub use structs::chunked::{
     super_array::{RechunkStrategy, SuperArray},
