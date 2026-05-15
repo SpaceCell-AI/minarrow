@@ -273,12 +273,82 @@ We follow Semantic Versioning (SemVer):
 
 ### Changelog
 
-Update `CHANGELOG.md` with:
-- New features
-- Bug fixes
-- Breaking changes
-- Performance improvements
-- Deprecations
+`CHANGELOG.md` lives at the repo root and follows the
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format.
+
+As PRs merge, add a line to the `## [Unreleased]` section at the top of
+`CHANGELOG.md`, under the relevant subsection:
+
+- **Added** - new features and APIs
+- **Changed** - changes in existing functionality (prefix breaking entries with
+  `**Breaking:**`)
+- **Deprecated** - APIs marked for removal in a future release
+- **Removed** - APIs removed in this release
+- **Fixed** - bug fixes
+- **Security** - vulnerability fixes
+
+Keep entries to user-facing changes. Internal refactors, CI tweaks, lint
+passes, and test-only changes are normally omitted.
+
+### Cutting a release
+
+1. **Confirm `main` is green.** All three `features` matrix checks
+   (`default`, `no-default-features`, `all-features`) must pass on the
+   release commit.
+
+2. **Finalise the changelog.** In `CHANGELOG.md`, rename
+   `## [Unreleased]` to `## [x.y.z] - YYYY-MM-DD` (today's date), and open a
+   fresh empty `## [Unreleased]` block above it. Add a compare link at the
+   bottom:
+   ```
+   [Unreleased]: https://github.com/pbower/minarrow/compare/vx.y.z...HEAD
+   [x.y.z]: https://github.com/pbower/minarrow/compare/v<prev>...vx.y.z
+   ```
+   Update the existing `[Unreleased]` link's left side to `vx.y.z`.
+
+3. **Bump the version.** Update `version = "x.y.z"` in `Cargo.toml`, then run
+   a build so `Cargo.lock` updates:
+   ```bash
+   cargo build --all-features
+   ```
+
+4. **Commit the release.** A single commit containing the `Cargo.toml`,
+   `Cargo.lock`, and `CHANGELOG.md` changes:
+   ```bash
+   git checkout -b release/x.y.z
+   git add Cargo.toml Cargo.lock CHANGELOG.md
+   git commit -m "Release x.y.z"
+   git push -u origin release/x.y.z
+   ```
+   Open a PR, wait for CI, merge into `main`.
+
+5. **Tag the merge commit on `main`.** Use an annotated tag and push it:
+   ```bash
+   git checkout main
+   git pull
+   git tag -a vx.y.z -m "minarrow x.y.z"
+   git push origin vx.y.z
+   ```
+
+6. **Publish to crates.io:**
+   ```bash
+   cargo publish
+   ```
+
+7. **Create the GitHub Release.** Mirror the `x.y.z` section from
+   `CHANGELOG.md` into the release notes:
+   ```bash
+   gh release create vx.y.z --title "minarrow x.y.z" --notes-file <(
+     awk "/^## \\[x\\.y\\.z\\]/,/^## \\[/{print}" CHANGELOG.md | sed '$d'
+   )
+   ```
+   Or paste the section by hand in the GitHub UI.
+
+### Tags
+
+Every release commit on `main` must carry an annotated tag `vx.y.z`
+(e.g. `v0.11.0`). The compare links in `CHANGELOG.md` resolve against these
+tags, and `cargo publish` records them as the source for crates.io / docs.rs.
 
 ## Community Guidelines
 
