@@ -137,15 +137,23 @@ pub fn bitmask_window_bytes_mut(mask: &mut Bitmask, offset: usize, len: usize) -
 }
 
 /// Zero all slack bits ≥ `bm.len`.
+///
+/// Clears the partial trailing bits inside the last logical byte (when
+/// `bm.len` is not byte-aligned) and every padding byte beyond that, so
+/// the slack stays zero after a kernel writes its output via u64-word
+/// strides.
 #[inline(always)]
 pub fn clear_trailing_bits(bm: &mut Bitmask) {
     if bm.len == 0 {
         return;
     }
+    let len_bytes = (bm.len + 7) / 8;
     let used = bm.len & 7;
     if used != 0 {
-        let last = bm.bits.last_mut().unwrap();
-        *last &= (1u8 << used) - 1;
+        bm.bits[len_bytes - 1] &= (1u8 << used) - 1;
+    }
+    for byte in bm.bits[len_bytes..].iter_mut() {
+        *byte = 0;
     }
 }
 

@@ -34,6 +34,7 @@ use std::ops::{BitAnd, BitOr, Deref, DerefMut, Index, Not};
 use crate::enums::shape_dim::ShapeDim;
 use crate::traits::concatenate::Concatenate;
 use crate::traits::shape::Shape;
+use crate::utils::align64;
 use crate::{BitmaskV, Buffer, Length, Offset};
 use vec64::Vec64;
 
@@ -79,24 +80,37 @@ impl Bitmask {
     }
 
     /// Ensures all unused bits above self.len are zeroed, per Arrow spec.
+    ///
+    /// Zeroes everything from `self.len` up to the physical end of the
+    /// backing buffer: the partial trailing bits inside the last logical
+    /// byte (when len is not byte-aligned) and every byte beyond that.
+    /// Keeps the padding slack reliably zero so word-stride readers see
+    /// only the logical bits.
     #[inline]
     pub fn mask_trailing_bits(&mut self) {
-        if self.len == 0 || (self.len & 7) == 0 {
+        if self.len == 0 {
             return;
         }
-        // Index the last byte that holds logical bits, not the last physical
-        // byte of the backing buffer. The two coincide for tightly-sized
-        // buffers but diverge when the bitmask was built with `Bitmask::new`
-        // over a larger Buffer<u8>.
-        let last = (self.len + 7) / 8 - 1;
-        let mask = (1u8 << (self.len & 7)) - 1;
-        self.bits[last] &= mask;
+        let len_bytes = (self.len + 7) / 8;
+        let used = self.len & 7;
+        if used != 0 {
+            // Mask off bits >= used within the partial last logical byte.
+            self.bits[len_bytes - 1] &= (1u8 << used) - 1;
+        }
+        // Zero every byte past the last logical byte (the word-padding slack).
+        for byte in self.bits[len_bytes..].iter_mut() {
+            *byte = 0;
+        }
     }
 
     /// Create new mask, length = `len`, all bits set if `set` else cleared.
+    ///
+    /// Allocates the byte buffer rounded up to a 64-byte boundary via
+    /// `align64`. Bits beyond `len` are zeroed by `mask_trailing_bits`
+    /// regardless of `set`.
     #[inline]
     pub fn new_set_all(len: usize, set: bool) -> Self {
-        let n_bytes = (len + 7) / 8;
+        let n_bytes = align64((len + 7) / 8);
         let mut data = Vec64::with_capacity(n_bytes);
         let fill = if set { 0xFF } else { 0 };
         data.resize(n_bytes, fill);
@@ -109,9 +123,12 @@ impl Bitmask {
     }
 
     /// Create with reserved capacity (bits), all bits cleared.
+    ///
+    /// Allocates the byte buffer rounded up to a 64-byte boundary via
+    /// `align64` so the padding slack is owned and zero-initialised.
     #[inline]
     pub fn with_capacity(bits: usize) -> Self {
-        let n_bytes = (bits + 7) / 8;
+        let n_bytes = align64((bits + 7) / 8);
         let mut data = Vec64::with_capacity(n_bytes);
         data.resize(n_bytes, 0);
         let mut mask = Self {
