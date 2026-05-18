@@ -20,21 +20,6 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
         config: [default, no-default-features, all-features]
-        exclude:
-          # `all-features` enables `vmap64`, which pulls in `vec64/mmap`.
-          # vec64 declares mmap Linux-only via a compile_error!, so the
-          # full all-features build is meaningful on Linux only. Non-Linux
-          # runners get the `non-linux-features` config below instead - it
-          # turns on every feature except the Linux-gated ones.
-          - os: macos-latest
-            config: all-features
-          - os: windows-latest
-            config: all-features
-        include:
-          - os: macos-latest
-            config: non-linux-features
-          - os: windows-latest
-            config: non-linux-features
     env:
       # Each config builds the full Polars/arrow-rs tree into every example
       # binary; trimming debug info keeps the target dir within disk limits.
@@ -62,16 +47,22 @@ jobs:
       - name: Set feature flags
         id: flags
         run: |
-          # `non-linux-features` mirrors `--all-features` but drops the
-          # Linux-only features (vmap64 = vec64/mmap, memfd). Keep this
-          # list in sync with [features] in Cargo.toml when new features
-          # are added.
-          NON_LINUX_FEATURES="parallel_proc,c_ffi_tests,default_categorical_8,extended_categorical,extended_numeric_types,cube,scalar_type,value_type,chunked,large_string,views,matrix,cast_arrow,cast_polars,datetime,simd,datetime_ops,str_arithmetic,fast_hash,broadcast,hash,size,arena,table_metadata,select"
+          # `vmap64` and `memfd` are Linux-only by design. On non-Linux
+          # runners, `--all-features` would enable `vec64/mmap` and trip
+          # vec64's compile_error!, so we substitute an explicit feature
+          # list that omits the two Linux-gated features. Keep this list
+          # in sync with [features] in Cargo.toml when new ones are added.
+          NON_LINUX_ALL_FEATURES="parallel_proc,c_ffi_tests,default_categorical_8,extended_categorical,extended_numeric_types,cube,scalar_type,value_type,chunked,large_string,views,matrix,cast_arrow,cast_polars,datetime,simd,datetime_ops,str_arithmetic,fast_hash,broadcast,hash,size,arena,table_metadata,select"
           case "${{ matrix.config }}" in
             default)             echo "args=" >> "$GITHUB_OUTPUT" ;;
             no-default-features) echo "args=--no-default-features" >> "$GITHUB_OUTPUT" ;;
-            all-features)        echo "args=--all-features" >> "$GITHUB_OUTPUT" ;;
-            non-linux-features)  echo "args=--no-default-features --features ${NON_LINUX_FEATURES}" >> "$GITHUB_OUTPUT" ;;
+            all-features)
+              if [ "${{ runner.os }}" = "Linux" ]; then
+                echo "args=--all-features" >> "$GITHUB_OUTPUT"
+              else
+                echo "args=--no-default-features --features ${NON_LINUX_ALL_FEATURES}" >> "$GITHUB_OUTPUT"
+              fi
+              ;;
           esac
 
       - run: cargo +nightly test ${{ steps.flags.outputs.args }} -- --quiet
