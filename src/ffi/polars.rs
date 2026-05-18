@@ -147,6 +147,32 @@ pub fn import_chunk(
     let arr_box = unsafe { Box::from_raw(arr_ptr) };
     let sch_box = unsafe { Box::from_raw(sch_ptr) };
 
+    // macOS edge case: polars_arrow's chunked dictionary export can populate
+    // arr.dictionary while leaving sch.dictionary null. The downstream import
+    // path would then fall back to a synthetic Utf8 schema and silently
+    // mis-parse i64 dictionary offsets as i32, producing corrupted strings.
+    // Surface a clear bridge error instead of risking silent data corruption.
+    #[cfg(target_os = "macos")]
+    {
+        if matches!(
+            dtype,
+            polars_arrow::datatypes::ArrowDataType::Dictionary(..)
+        ) && !arr_box.dictionary.is_null()
+            && sch_box.dictionary.is_null()
+        {
+            return Err(MinarrowError::BridgeError {
+                source: "polars",
+                message:
+                    "Due to a Polars FFI boundary edge case this operation \
+                     is currently unsupported on macOS, due to silent \
+                     failure concerns. If this affects you for an important \
+                     use case, please file an issue and/or PR and we can \
+                     consider allocating resources to the fix."
+                        .to_string(),
+            });
+        }
+    }
+
     let (array, mut field) = unsafe { import_from_c_owned(arr_box, sch_box) };
     field.name = name.to_string();
     Ok((array, field))
