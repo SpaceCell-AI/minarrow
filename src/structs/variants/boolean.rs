@@ -966,6 +966,56 @@ impl<T: Send + Sync> BooleanArray<T> {
     }
 }
 
+#[cfg(feature = "chunked")]
+impl<'a> crate::traits::consolidate::Consolidate
+    for Vec<crate::aliases::BooleanAVT<'a, ()>>
+{
+    type Output = BooleanArray<()>;
+
+    /// Consolidate a vector of `(BooleanArray, offset, len)` view tuples
+    /// into one contiguous `BooleanArray`. Copies bits directly from
+    /// each source bitmask window into the result.
+    fn consolidate(self) -> BooleanArray<()> {
+        use crate::structs::bitmask::Bitmask;
+        use crate::traits::consolidate::extend_null_mask;
+        use crate::traits::masked_array::MaskedArray;
+
+        assert!(!self.is_empty(), "consolidate() called on empty Vec<BooleanAVT>");
+
+        let total_len: usize = self.iter().map(|(_, _, len)| *len).sum();
+        let has_nulls = self.iter().any(|(arr, _, _)| arr.null_mask.is_some());
+
+        let mut result_data = Bitmask::new_set_all(total_len, false);
+        let mut result_mask: Option<Bitmask> = if has_nulls {
+            Some(Bitmask::new_set_all(total_len, true))
+        } else {
+            None
+        };
+        let mut current_pos = 0usize;
+
+        for (arr, offset, len) in &self {
+            for i in 0..*len {
+                let bit = unsafe { arr.data.get_unchecked(*offset + i) };
+                unsafe { result_data.set_unchecked(current_pos + i, bit) };
+            }
+            extend_null_mask(
+                &mut result_mask,
+                current_pos,
+                arr.null_mask(),
+                *offset,
+                *len,
+            );
+            current_pos += *len;
+        }
+
+        result_data.mask_trailing_bits();
+        if let Some(mask) = &mut result_mask {
+            mask.mask_trailing_bits();
+        }
+        BooleanArray::new(result_data, result_mask)
+    }
+}
+
 impl Shape for BooleanArray<()> {
     fn shape(&self) -> ShapeDim {
         ShapeDim::Rank1(self.len())

@@ -196,6 +196,21 @@ str_arithmetic = ["ryu", "memchr"]
 # and categorical dictionary interning with the faster ahash.
 fast_hash = ["dep:ahash"]
 
+# Enables cross-batch shared categorical dictionaries. Adds:
+# - `Dictionary::Shared(Arc<DictionaryInner<T>>)` for snapshot-based read
+#   sharing across batches that point at a common dictionary store.
+# - `CategoryManager<T>` writer-side handle that owns the store and
+#   exposes concurrent `intern` against it.
+# - `CategoryDispatch` width-erased holder used by parents (`SuperTable`)
+#   to keep one manager per categorical column.
+# - `SuperTable`'s absorb path that intern-merges each pushed batch's
+#   dictionary into the column's manager and rebinds the batch to a
+#   `Shared` snapshot.
+#
+# Without this feature, every `CategoricalArray<T>` owns its dictionary
+# outright and codes are not mutually meaningful across batches.
+shared_dict = ["chunked"]
+
 # Swaps `CategoryManager`'s default `Mutex<Arc<DictionaryInner<T>>>` storage
 # for `arc_swap::ArcSwap<DictionaryInner<T>>`. The lock-free CAS-retry write
 # path is useful when concurrent novel-value insertion on a shared
@@ -203,7 +218,7 @@ fast_hash = ["dep:ahash"]
 # genuinely new strings). Reads on `Shared` snapshots are lock-free under
 # both backends, so this only really matters under genuine write contention
 # (or where mutex acquisition latency would otherwise dominate).
-contended_dict = ["dep:arc_swap"]
+contended_dict = ["shared_dict", "dep:arc_swap"]
 
 # Adds typed arithmetic broadcasting for add, sub, mult, div, rem
 broadcast = []

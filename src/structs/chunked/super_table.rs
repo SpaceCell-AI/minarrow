@@ -50,14 +50,11 @@ use std::sync::Arc;
 
 use crate::enums::{error::MinarrowError, shape_dim::ShapeDim};
 use crate::structs::chunked::super_array::RechunkStrategy;
-use crate::structs::dictionary::{CategoryDispatch, CategoryManager, Dictionary, DictionaryError};
+#[cfg(feature = "shared_dict")]
+use crate::structs::dictionary::CategoryDispatch;
 use crate::structs::field::Field;
 use crate::structs::field_array::FieldArray;
 use crate::structs::table::Table;
-use crate::structs::variants::categorical::CategoricalArray;
-use crate::traits::masked_array::MaskedArray;
-use crate::traits::type_unions::Integer;
-use crate::{Array, TextArray};
 #[cfg(feature = "size")]
 use crate::traits::byte_size::ByteSize;
 use crate::traits::concatenate::Concatenate;
@@ -99,7 +96,8 @@ pub struct SuperTable {
     /// is categorical. Owns the dictionary that every batch's
     /// `Dictionary::Shared` snapshot points at. New values are added by
     /// calling the manager's `intern` method, which is safe to call from
-    /// multiple threads at once.
+    /// multiple threads at once. Available with the `shared_dict` feature.
+    #[cfg(feature = "shared_dict")]
     pub(crate) category_managers: Vec<Option<CategoryDispatch>>,
 }
 
@@ -125,6 +123,7 @@ impl SuperTable {
             schema: Vec::new(),
             n_rows: 0,
             name,
+            #[cfg(feature = "shared_dict")]
             category_managers: Vec::new(),
         }
     }
@@ -160,13 +159,16 @@ impl SuperTable {
             total_rows += batch.n_rows;
         }
 
+        #[cfg_attr(not(feature = "shared_dict"), allow(unused_mut))]
         let mut st = Self {
             batches,
             schema,
             n_rows: total_rows,
             name,
+            #[cfg(feature = "shared_dict")]
             category_managers: Vec::new(),
         };
+        #[cfg(feature = "shared_dict")]
         st.rebuild_category_managers();
         st
     }
@@ -188,7 +190,10 @@ impl SuperTable {
     pub fn push(&mut self, batch: Arc<Table>) {
         if self.batches.is_empty() {
             self.schema = batch.cols.iter().map(|fa| fa.field.clone()).collect();
-            self.category_managers = vec![None; self.schema.len()];
+            #[cfg(feature = "shared_dict")]
+            {
+                self.category_managers = vec![None; self.schema.len()];
+            }
         }
         let n_cols = self.schema.len();
         assert_eq!(batch.n_cols(), n_cols, "Pushed batch column-count mismatch");
@@ -201,46 +206,28 @@ impl SuperTable {
             );
         }
 
+        #[cfg_attr(not(feature = "shared_dict"), allow(unused_mut))]
         let mut batch = batch;
+        #[cfg(feature = "shared_dict")]
         self.absorb_dict_categories(&mut batch);
 
         self.n_rows += batch.n_rows;
         self.batches.push(batch);
     }
 
-    /// Public entry point for adding a new categorical value through the
-    /// SuperTable's manager for the column at `col_idx`. Use this when a
-    /// categorical's dictionary is `Shared` and you need to add a value
-    /// that the dictionary does not already hold. The manager's `intern`
-    /// is safe to call concurrently.
+    /// Borrow the `CategoryDispatch` for the column at `col_idx`, or
+    /// `None` if the column is not categorical (or `col_idx` is out of
+    /// bounds). The caller matches on the dispatch variant to reach the
+    /// width-typed `CategoryManager` and call `intern` / `snapshot` on it.
     ///
-    /// Returns the assigned code as `T`. The caller is responsible for
-    /// appending the code into the relevant data buffer.
-    ///
-    /// Errors:
-    /// - `DictionaryError::Overflow` if the new cardinality would exceed
-    ///   the capacity of `T`.
-    /// - `MinarrowError::IndexError` if `col_idx` is out of bounds or the
-    ///   column is not categorical at width `T`.
-    pub fn intern_in_column<T: Integer>(
-        &self,
-        col_idx: usize,
-        value: &str,
-    ) -> Result<T, MinarrowError> {
-        let slot = self.category_managers.get(col_idx).ok_or_else(|| {
-            MinarrowError::IndexError(format!(
-                "intern_in_column: col_idx {} is out of bounds (n_cols={})",
-                col_idx,
-                self.category_managers.len()
-            ))
-        })?;
-        let dispatch = slot.as_ref().ok_or_else(|| {
-            MinarrowError::IndexError(format!(
-                "intern_in_column: column {} is not categorical",
-                col_idx
-            ))
-        })?;
-        intern_via_dispatch::<T>(dispatch, value)
+    /// This is the entry point for live ingestion against a categorical
+    /// that has already been absorbed into the SuperTable: the manager
+    /// extends the shared dictionary once and every sibling batch's
+    /// snapshot remains coherent under the append-only invariant.
+    #[cfg(feature = "shared_dict")]
+    #[inline]
+    pub fn category_dispatch(&self, col_idx: usize) -> Option<&CategoryDispatch> {
+        self.category_managers.get(col_idx)?.as_ref()
     }
 
     /// Rebuild `category_managers` from the current `batches`. Used by
@@ -249,6 +236,7 @@ impl SuperTable {
     /// batch's dictionary for each categorical column is taken as the
     /// starting state; subsequent batches' dictionaries are folded in by
     /// the same logic as `push`.
+    #[cfg(feature = "shared_dict")]
     pub(crate) fn rebuild_category_managers(&mut self) {
         if self.batches.is_empty() {
             self.category_managers.clear();
@@ -270,6 +258,7 @@ impl SuperTable {
     /// Intern incoming's categorical columns into this SuperTable's
     /// managers, remap codes if needed, and set the batch's dictionaries
     /// to `Shared` snapshots of the managers.
+    #[cfg(feature = "shared_dict")]
     fn absorb_dict_categories(&mut self, incoming: &mut Arc<Table>) {
         let n_cols = self.schema.len();
         for col_idx in 0..n_cols {
@@ -532,13 +521,16 @@ impl SuperTable {
             batches.push(table.into());
         }
         let schema = slices[0].fields.iter().cloned().collect();
+        #[cfg_attr(not(feature = "shared_dict"), allow(unused_mut))]
         let mut st = Self {
             batches,
             schema,
             n_rows: total_rows,
             name,
+            #[cfg(feature = "shared_dict")]
             category_managers: Vec::new(),
         };
+        #[cfg(feature = "shared_dict")]
         st.rebuild_category_managers();
         st
     }
@@ -965,13 +957,16 @@ impl Concatenate for SuperTable {
         result_batches.extend(other.batches);
         let total_rows = self.n_rows + other.n_rows;
 
+        #[cfg_attr(not(feature = "shared_dict"), allow(unused_mut))]
         let mut st = SuperTable {
             batches: result_batches,
             schema: self.schema,
             n_rows: total_rows,
             name: format!("{}+{}", self.name, other.name),
+            #[cfg(feature = "shared_dict")]
             category_managers: Vec::new(),
         };
+        #[cfg(feature = "shared_dict")]
         st.rebuild_category_managers();
         Ok(st)
     }
@@ -1217,255 +1212,18 @@ impl From<SuperTableV> for SuperTable {
     }
 }
 
-/// Absorbs one column's categorical dictionary into the SuperTable's
-/// `CategoryManager` for that column, remapping the incoming batch's codes
-/// if necessary and setting the batch's dictionary to a `Shared` snapshot
-/// of the manager. Non-categorical columns are skipped.
+/// Absorb one column from `incoming` into the SuperTable's per-column
+/// dispatch. Non-categorical columns are skipped. All width-specific work
+/// lives behind `CategoryDispatch::absorb` / `CategoryDispatch::install_from`.
+#[cfg(feature = "shared_dict")]
 fn absorb_one_column(table: &mut SuperTable, col_idx: usize, incoming: &mut Arc<Table>) {
-    match &incoming.cols[col_idx].array {
-        #[cfg(any(not(feature = "default_categorical_8"), feature = "extended_categorical"))]
-        Array::TextArray(TextArray::Categorical32(_)) => {
-            absorb_typed::<u32>(table, col_idx, incoming, CategoryDispatch::U32);
-        }
-        #[cfg(feature = "default_categorical_8")]
-        Array::TextArray(TextArray::Categorical8(_)) => {
-            absorb_typed::<u8>(table, col_idx, incoming, CategoryDispatch::U8);
-        }
-        #[cfg(feature = "extended_categorical")]
-        Array::TextArray(TextArray::Categorical16(_)) => {
-            absorb_typed::<u16>(table, col_idx, incoming, CategoryDispatch::U16);
-        }
-        #[cfg(feature = "extended_categorical")]
-        Array::TextArray(TextArray::Categorical64(_)) => {
-            absorb_typed::<u64>(table, col_idx, incoming, CategoryDispatch::U64);
-        }
-        _ => {}
-    }
-}
-
-/// Typed worker for `absorb_one_column`. Generic over the index width and
-/// parameterised by a constructor that wraps a `CategoryManager<T>` into
-/// the matching `CategoryDispatch` variant, so the dispatch shape is set
-/// at the call site without any type-erasure tricks.
-fn absorb_typed<T: Integer>(
-    table: &mut SuperTable,
-    col_idx: usize,
-    incoming: &mut Arc<Table>,
-    wrap: fn(CategoryManager<T>) -> CategoryDispatch,
-) {
-    let cat = match get_cat_typed::<T>(&incoming.cols[col_idx]) {
-        Some(c) => c,
-        None => return,
-    };
-
     if table.category_managers.len() <= col_idx {
         table.category_managers.resize_with(col_idx + 1, || None);
     }
-
-    // First time we see this column: seed the manager from the batch's own
-    // dictionary so existing codes line up without remapping.
-    if table.category_managers[col_idx].is_none() {
-        let inner = (*cat.dictionary.values_arc_or_clone()).clone();
-        let manager = CategoryManager::<T>::from_inner(inner);
-        let snapshot = manager.snapshot();
-        table.category_managers[col_idx] = Some(wrap(manager));
-        bind_shared_snapshot::<T>(incoming, col_idx, snapshot);
-        return;
-    }
-
-    // Subsequent batches: intern every value into the manager and remap if
-    // any code shifted.
-    let dispatch = table.category_managers[col_idx]
-        .as_ref()
-        .expect("category_managers[col_idx] is Some by construction");
-    let manager = match get_manager_typed::<T>(dispatch) {
-        Some(m) => m,
-        None => return,
-    };
-
-    let values = cat.dictionary.values();
-    let mut needs_remap = false;
-    let mut remap: Vec<T> = Vec::with_capacity(values.len());
-    for (incoming_code, value) in values.iter().enumerate() {
-        let new_code = match manager.intern(value) {
-            Ok(c) => c,
-            Err(_) => return, // overflow is reported at the caller's level
-        };
-        if new_code.to_usize() != incoming_code {
-            needs_remap = true;
-        }
-        remap.push(new_code);
-    }
-
-    if needs_remap {
-        remap_data_typed::<T>(incoming, col_idx, &remap);
-    }
-    bind_shared_snapshot::<T>(incoming, col_idx, manager.snapshot());
-}
-
-/// Returns the typed `CategoricalArray<T>` inside this `FieldArray`, or
-/// `None` if the column is not categorical at width `T`.
-fn get_cat_typed<T: Integer>(fa: &FieldArray) -> Option<&CategoricalArray<T>> {
-    let arc_ref: Option<&Arc<CategoricalArray<T>>> = match &fa.array {
-        #[cfg(any(not(feature = "default_categorical_8"), feature = "extended_categorical"))]
-        Array::TextArray(TextArray::Categorical32(arc))
-            if std::any::TypeId::of::<T>() == std::any::TypeId::of::<u32>() =>
-        {
-            // SAFETY: the TypeId guard guarantees T == u32 at this arm.
-            Some(unsafe { &*(arc as *const Arc<CategoricalArray<u32>> as *const Arc<CategoricalArray<T>>) })
-        }
-        #[cfg(feature = "default_categorical_8")]
-        Array::TextArray(TextArray::Categorical8(arc))
-            if std::any::TypeId::of::<T>() == std::any::TypeId::of::<u8>() =>
-        {
-            Some(unsafe { &*(arc as *const Arc<CategoricalArray<u8>> as *const Arc<CategoricalArray<T>>) })
-        }
-        #[cfg(feature = "extended_categorical")]
-        Array::TextArray(TextArray::Categorical16(arc))
-            if std::any::TypeId::of::<T>() == std::any::TypeId::of::<u16>() =>
-        {
-            Some(unsafe { &*(arc as *const Arc<CategoricalArray<u16>> as *const Arc<CategoricalArray<T>>) })
-        }
-        #[cfg(feature = "extended_categorical")]
-        Array::TextArray(TextArray::Categorical64(arc))
-            if std::any::TypeId::of::<T>() == std::any::TypeId::of::<u64>() =>
-        {
-            Some(unsafe { &*(arc as *const Arc<CategoricalArray<u64>> as *const Arc<CategoricalArray<T>>) })
-        }
-        _ => None,
-    };
-    arc_ref.map(|a| a.as_ref())
-}
-
-/// Extracts a typed `&CategoryManager<T>` from a `CategoryDispatch` if the
-/// width matches, otherwise `None`.
-fn get_manager_typed<T: Integer>(dispatch: &CategoryDispatch) -> Option<&CategoryManager<T>> {
-    match dispatch {
-        #[cfg(feature = "default_categorical_8")]
-        CategoryDispatch::U8(m) if std::any::TypeId::of::<T>() == std::any::TypeId::of::<u8>() => {
-            Some(unsafe { &*(m as *const CategoryManager<u8> as *const CategoryManager<T>) })
-        }
-        #[cfg(feature = "extended_categorical")]
-        CategoryDispatch::U16(m) if std::any::TypeId::of::<T>() == std::any::TypeId::of::<u16>() => {
-            Some(unsafe { &*(m as *const CategoryManager<u16> as *const CategoryManager<T>) })
-        }
-        #[cfg(any(not(feature = "default_categorical_8"), feature = "extended_categorical"))]
-        CategoryDispatch::U32(m) if std::any::TypeId::of::<T>() == std::any::TypeId::of::<u32>() => {
-            Some(unsafe { &*(m as *const CategoryManager<u32> as *const CategoryManager<T>) })
-        }
-        #[cfg(feature = "extended_categorical")]
-        CategoryDispatch::U64(m) if std::any::TypeId::of::<T>() == std::any::TypeId::of::<u64>() => {
-            Some(unsafe { &*(m as *const CategoryManager<u64> as *const CategoryManager<T>) })
-        }
-        _ => None,
-    }
-}
-
-/// Replaces a batch's column dictionary with a `Shared` snapshot. The data
-/// buffer is left untouched; if the snapshot is not a superset of the
-/// previous one, the caller is responsible for having called
-/// `remap_data_typed` first.
-fn bind_shared_snapshot<T: Integer>(
-    batch: &mut Arc<Table>,
-    col_idx: usize,
-    snapshot: Arc<crate::structs::dictionary::DictionaryInner<T>>,
-) {
-    let table = Arc::make_mut(batch);
-    let fa = &mut table.cols[col_idx];
-    set_dictionary_typed::<T>(&mut fa.array, Dictionary::Shared(snapshot));
-}
-
-/// Walks a batch's column data buffer, replacing each code with
-/// `remap[code]`. Used after a manager grew through additions and the
-/// batch's codes need to be re-pointed at the new positions.
-fn remap_data_typed<T: Integer>(batch: &mut Arc<Table>, col_idx: usize, remap: &[T]) {
-    let table = Arc::make_mut(batch);
-    let fa = &mut table.cols[col_idx];
-    let inner = match cat_inner_mut_typed::<T>(&mut fa.array) {
-        Some(c) => c,
-        None => return,
-    };
-    for code in inner.data.iter_mut() {
-        *code = remap[code.to_usize()];
-    }
-}
-
-/// Sets a categorical column's dictionary to `new_dict`. Used when binding
-/// a fresh `Shared` snapshot to a batch's column.
-fn set_dictionary_typed<T: Integer>(array: &mut Array, new_dict: Dictionary<T>) {
-    let inner = match cat_inner_mut_typed::<T>(array) {
-        Some(c) => c,
-        None => return,
-    };
-    inner.dictionary = new_dict;
-}
-
-/// Returns a mutable reference to the inner `CategoricalArray<T>` of a
-/// categorical column. Forks the `Arc<CategoricalArray<T>>` if shared so
-/// the caller gets exclusive access.
-fn cat_inner_mut_typed<T: Integer>(array: &mut Array) -> Option<&mut CategoricalArray<T>> {
-    match array {
-        #[cfg(any(not(feature = "default_categorical_8"), feature = "extended_categorical"))]
-        Array::TextArray(TextArray::Categorical32(arc))
-            if std::any::TypeId::of::<T>() == std::any::TypeId::of::<u32>() =>
-        {
-            let m: &mut CategoricalArray<u32> = Arc::make_mut(arc);
-            Some(unsafe { &mut *(m as *mut CategoricalArray<u32> as *mut CategoricalArray<T>) })
-        }
-        #[cfg(feature = "default_categorical_8")]
-        Array::TextArray(TextArray::Categorical8(arc))
-            if std::any::TypeId::of::<T>() == std::any::TypeId::of::<u8>() =>
-        {
-            let m: &mut CategoricalArray<u8> = Arc::make_mut(arc);
-            Some(unsafe { &mut *(m as *mut CategoricalArray<u8> as *mut CategoricalArray<T>) })
-        }
-        #[cfg(feature = "extended_categorical")]
-        Array::TextArray(TextArray::Categorical16(arc))
-            if std::any::TypeId::of::<T>() == std::any::TypeId::of::<u16>() =>
-        {
-            let m: &mut CategoricalArray<u16> = Arc::make_mut(arc);
-            Some(unsafe { &mut *(m as *mut CategoricalArray<u16> as *mut CategoricalArray<T>) })
-        }
-        #[cfg(feature = "extended_categorical")]
-        Array::TextArray(TextArray::Categorical64(arc))
-            if std::any::TypeId::of::<T>() == std::any::TypeId::of::<u64>() =>
-        {
-            let m: &mut CategoricalArray<u64> = Arc::make_mut(arc);
-            Some(unsafe { &mut *(m as *mut CategoricalArray<u64> as *mut CategoricalArray<T>) })
-        }
-        _ => None,
-    }
-}
-
-/// Public-facing intern through a `CategoryDispatch`. Dispatches to the
-/// typed manager based on `T`.
-fn intern_via_dispatch<T: Integer>(
-    dispatch: &CategoryDispatch,
-    value: &str,
-) -> Result<T, MinarrowError> {
-    let manager = get_manager_typed::<T>(dispatch).ok_or_else(|| {
-        MinarrowError::IndexError(format!(
-            "intern_via_dispatch: requested width {} does not match the column's manager",
-            std::any::type_name::<T>()
-        ))
-    })?;
-    manager.intern(value).map_err(Into::into)
-}
-
-/// Bridge helper on `Dictionary` to fetch an `Arc<DictionaryInner<T>>` for
-/// the value used by `absorb_typed` to seed the manager. For `Owned` we
-/// clone the inner into a fresh `Arc`; for `Shared` we clone the existing
-/// `Arc`. Lives here because it is the SuperTable side that needs it.
-trait DictionaryValuesArc<T: Integer> {
-    fn values_arc_or_clone(&self) -> Arc<crate::structs::dictionary::DictionaryInner<T>>;
-}
-
-impl<T: Integer> DictionaryValuesArc<T> for Dictionary<T> {
-    fn values_arc_or_clone(&self) -> Arc<crate::structs::dictionary::DictionaryInner<T>> {
-        match self {
-            Dictionary::Owned(d) => Arc::new(d.clone()),
-            Dictionary::Shared(a) => Arc::clone(a),
-        }
+    let array = &mut Arc::make_mut(incoming).cols[col_idx].array;
+    match &mut table.category_managers[col_idx] {
+        Some(dispatch) => dispatch.absorb(array),
+        slot @ None => *slot = CategoryDispatch::install_from(array),
     }
 }
 

@@ -1481,6 +1481,71 @@ impl<T: Integer> Shape for StringArray<T> {
     }
 }
 
+#[cfg(feature = "chunked")]
+impl<'a, T: Integer> crate::traits::consolidate::Consolidate
+    for Vec<crate::aliases::StringAVT<'a, T>>
+{
+    type Output = StringArray<T>;
+
+    /// Consolidate a vector of `(StringArray<T>, offset, len)` view tuples
+    /// into one contiguous `StringArray<T>`. Reads bytes directly from
+    /// each source buffer in the `[offsets[offset], offsets[offset+len])`
+    /// byte range, and rewrites offsets shifted by the running byte
+    /// count to maintain Arrow's monotonic-offset invariant.
+    fn consolidate(self) -> StringArray<T> {
+        use crate::structs::bitmask::Bitmask;
+        use crate::traits::consolidate::extend_null_mask;
+        use crate::traits::masked_array::MaskedArray;
+
+        assert!(!self.is_empty(), "consolidate() called on empty Vec<StringAVT>");
+
+        let total_len: usize = self.iter().map(|(_, _, len)| *len).sum();
+        let has_nulls = self.iter().any(|(arr, _, _)| arr.null_mask.is_some());
+
+        let mut result_offsets: Vec64<T> = Vec64::with_capacity(total_len + 1);
+        let mut result_data: Vec64<u8> = Vec64::new();
+        let mut result_mask: Option<Bitmask> = if has_nulls {
+            Some(Bitmask::default())
+        } else {
+            None
+        };
+        let mut current_len = 0;
+
+        result_offsets.push(T::default());
+
+        for (arr, offset, len) in &self {
+            let offsets = arr.offsets.as_slice();
+            let data = arr.data.as_slice();
+
+            let start_idx = *offset;
+            let end_idx = *offset + *len;
+            let byte_start = offsets[start_idx].to_usize();
+            let byte_end = offsets[end_idx].to_usize();
+            let current_data_len = (*result_offsets.last().unwrap()).to_usize();
+
+            result_data.extend_from_slice(&data[byte_start..byte_end]);
+
+            for i in (start_idx + 1)..=end_idx {
+                let adjusted = T::from_usize(
+                    (offsets[i].to_usize() - byte_start) + current_data_len,
+                );
+                result_offsets.push(adjusted);
+            }
+
+            extend_null_mask(
+                &mut result_mask,
+                current_len,
+                arr.null_mask(),
+                *offset,
+                *len,
+            );
+            current_len += *len;
+        }
+
+        StringArray::<T>::from_parts(result_offsets, result_data, result_mask)
+    }
+}
+
 impl<T: Integer> Concatenate for StringArray<T> {
     fn concat(
         mut self,

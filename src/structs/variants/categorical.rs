@@ -37,6 +37,7 @@
 use std::collections::HashMap;
 use std::fmt::{Debug, Display, Formatter};
 use std::slice::{Iter, IterMut};
+#[cfg(feature = "shared_dict")]
 use std::sync::Arc;
 
 #[cfg(feature = "parallel_proc")]
@@ -45,7 +46,9 @@ use rayon::iter::ParallelIterator;
 use crate::aliases::CategoricalAVT;
 use crate::enums::error::MinarrowError;
 use crate::enums::shape_dim::ShapeDim;
-use crate::structs::dictionary::{Dictionary, DictionaryInner};
+use crate::structs::dictionary::Dictionary;
+#[cfg(feature = "shared_dict")]
+use crate::structs::dictionary::DictionaryInner;
 use crate::traits::concatenate::Concatenate;
 use crate::traits::shape::Shape;
 use crate::traits::type_unions::Integer;
@@ -185,11 +188,12 @@ impl<T: Integer> CategoricalArray<T> {
     }
 
     /// Constructs a `CategoricalArray` against a pre-existing shared
-    /// `Arc<Dictionary>`. The resulting array's codes are interpreted
-    /// against that dictionary, so they remain mutually meaningful with
-    /// any other array built against the same Arc. This is the path used
-    /// by streaming batch consolidation and by FFI imports that have
-    /// already deduplicated dictionaries upstream.
+    /// `Arc<DictionaryInner<T>>`. The resulting array's codes are
+    /// interpreted against that dictionary, so they remain mutually
+    /// meaningful with any other array built against the same Arc. This
+    /// is the path used by streaming batch consolidation and by FFI
+    /// imports that have already deduplicated dictionaries upstream.
+    #[cfg(feature = "shared_dict")]
     #[inline]
     pub fn with_dictionary(
         data: impl Into<Buffer<T>>,
@@ -347,11 +351,12 @@ impl<T: Integer> CategoricalArray<T> {
     /// The dictionary's append-only invariant means existing entries are
     /// never reordered or replaced in normal use. Mutating an existing value
     /// at position `k` will silently invalidate every code `k` already
-    /// minted against this array's data buffer. Use only when you understand
+    /// assigned against this array's data buffer. Use only when you understand
     /// that consequence; prefer `push_str` for adding new values.
     pub fn values_iter_mut(&mut self) -> IterMut<'_, String> {
         match &mut self.dictionary {
             Dictionary::Owned(inner) => inner.values.iter_mut(),
+            #[cfg(feature = "shared_dict")]
             Dictionary::Shared(_) => panic!(
                 "CategoricalArray's dictionary is Shared; values_iter_mut would \
                  desynchronise it from sibling batches. Promote the dictionary \
@@ -1282,6 +1287,92 @@ impl<T: Integer + Send + Sync> CategoricalArray<T> {
             let idx = unsafe { *idx_buf.get_unchecked(i) }.to_usize();
             Some(unsafe { dict.get_unchecked(idx).as_str() })
         })
+    }
+}
+
+#[cfg(feature = "chunked")]
+impl<'a, T: Integer> crate::traits::consolidate::Consolidate
+    for Vec<crate::aliases::CategoricalAVT<'a, T>>
+{
+    type Output = CategoricalArray<T>;
+
+    /// Consolidate a vector of `(CategoricalArray<T>, offset, len)` view
+    /// tuples into one contiguous `CategoricalArray<T>`.
+    ///
+    /// When every chunk shares the same `Shared` dictionary
+    /// (`Arc::ptr_eq` via `shares_with`), the indices buffers are
+    /// concatenated directly and the result binds to the same dictionary
+    /// snapshot - one copy per chunk, no dictionary work. Otherwise
+    /// each view is slice-cloned and folded via `Concatenate::concat`,
+    /// which handles the prefix and divergent-intern paths internally.
+    fn consolidate(self) -> CategoricalArray<T> {
+        use crate::traits::masked_array::MaskedArray;
+
+        assert!(!self.is_empty(), "consolidate() called on empty Vec<CategoricalAVT>");
+
+        // Fast path: all chunks point at the same Shared dictionary Arc.
+        // `shares_with` is always `false` without the `shared_dict`
+        // feature, so this branch is only ever taken under it.
+        #[cfg(feature = "shared_dict")]
+        {
+            use crate::structs::bitmask::Bitmask;
+            use crate::traits::consolidate::extend_null_mask;
+
+            let first_dict = &self[0].0.dictionary;
+            let all_same_dict = self
+                .iter()
+                .all(|(arr, _, _)| arr.dictionary.shares_with(first_dict));
+
+            if all_same_dict {
+                let total_len: usize = self.iter().map(|(_, _, len)| *len).sum();
+                let has_nulls = self.iter().any(|(arr, _, _)| arr.null_mask.is_some());
+
+                let mut result_data: Vec64<T> = Vec64::with_capacity(total_len);
+                let mut result_mask: Option<Bitmask> = if has_nulls {
+                    Some(Bitmask::default())
+                } else {
+                    None
+                };
+                let mut current_len = 0;
+
+                for (arr, offset, len) in &self {
+                    let data: &[T] = &arr.data[*offset..*offset + *len];
+                    result_data.extend_from_slice(data);
+                    extend_null_mask(
+                        &mut result_mask,
+                        current_len,
+                        arr.null_mask(),
+                        *offset,
+                        *len,
+                    );
+                    current_len += *len;
+                }
+
+                let snapshot = first_dict
+                    .as_shared()
+                    .expect("first chunk is Shared by all_same_dict above")
+                    .clone();
+                return CategoricalArray::<T>::with_dictionary(
+                    result_data,
+                    snapshot,
+                    result_mask,
+                );
+            }
+        }
+
+        // Fallback: divergent dictionaries. Slice-clone each view and
+        // fold through `Concatenate::concat`, which already handles the
+        // prefix and divergent-intern paths.
+        let mut iter = self.into_iter();
+        let (first_arr, first_off, first_len) = iter.next().expect("non-empty");
+        let mut result = first_arr.slice_clone(first_off, first_len);
+        for (arr, off, len) in iter {
+            let chunk = arr.slice_clone(off, len);
+            result = result
+                .concat(chunk)
+                .expect("Failed to concatenate CategoricalArray");
+        }
+        result
     }
 }
 

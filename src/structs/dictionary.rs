@@ -17,29 +17,30 @@
 //! Backs `CategoricalArray<T>`. Pairs the ordered list of unique strings with
 //! an internal hashmap so interning runs in O(1) rather than O(n) linear scan.
 //!
-//! ## Two ownership modes
+//! ## Ownership modes
 //! `Dictionary<T>` is an enum mirroring how `Buffer<T>` distinguishes
 //! standalone from shared storage:
 //!
 //! - `Owned(DictionaryInner<T>)`: the categorical owns its dictionary outright
-//!   and is free to mutate it. This is the standalone path.
-//! - `Shared(Arc<DictionaryInner<T>>)`: the categorical holds an immutable view
-//!   of a dictionary that is canonically held by a parent (`SuperTable` /
-//!   `SuperArray`). All sibling batches in that parent point at the same Arc,
-//!   so codes are mutually meaningful across the entire structure. Mutating a
-//!   `Shared` dictionary directly panics; growth must go through the parent's
-//!   mediated API so the parent can rebind every sibling.
+//!   and is free to mutate it. This is the standalone path and the only path
+//!   available without the `shared_dict` feature.
+//! - `Shared(Arc<DictionaryInner<T>>)` *(feature: `shared_dict`)*: the
+//!   categorical holds an immutable view of a dictionary held by a parent
+//!   (`SuperTable`). All sibling batches in that parent point at the same Arc,
+//!   so codes are mutually meaningful across the entire structure. Direct
+//!   mutation returns `DictionaryError::Shared`; growth must go through the
+//!   parent's `CategoryManager` so every sibling stays coherent.
 //!
 //! ## Append-only invariant
 //! Once a string is interned and assigned a code, that mapping is permanent
 //! in both modes: entries are never reordered, replaced, or removed. A
 //! dictionary that is a prefix of another agrees on every code they share,
-//! which is what makes `Shared` rebinding cheap when the parent grows the
-//! canonical: the old codes remain valid against the new Arc.
+//! which is what makes `Shared` rebinding cheap when the manager grows the
+//! store: the old codes remain valid against the new Arc.
 //!
 //! ## Generic over T
 //! `T` is the index width of the owning `CategoricalArray<T>`. Codes are
-//! minted as `T` directly, capping cardinality at the width's limit
+//! assigned as `T` directly, capping cardinality at the width's limit
 //! (256 for `u8`, etc.) and removing the cast ceremony at call-sites.
 
 use std::fmt;
@@ -53,15 +54,17 @@ use crate::traits::type_unions::Integer;
 /// Errors that may arise from mutating a `Dictionary<T>`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DictionaryError {
-    /// The dictionary is in `Shared` mode, meaning it is bound to a canonical
-    /// dictionary held by a parent (`SuperTable` / `SuperArray`). Growth must
-    /// go through the parent's mediated API so every sibling batch stays
-    /// coherent with the canonical. Attempting to grow it in isolation would
-    /// silently desynchronise the parent and other batches.
+    /// The dictionary is in `Shared` mode, meaning it is bound to a store
+    /// held by a parent `CategoryManager`. Growth must go through the
+    /// parent so every sibling batch stays coherent. Attempting to grow
+    /// it in isolation would silently desynchronise the parent and other
+    /// batches.
     ///
     /// On receiving this error, route the operation through the parent that
-    /// owns the categorical column (typically a `SuperTable` method that
-    /// updates the canonical and rebinds sibling batches).
+    /// owns the categorical column (typically a `SuperTable`'s
+    /// `CategoryManager` for that column, reached via
+    /// `SuperTable::category_dispatch`).
+    #[cfg(feature = "shared_dict")]
     Shared,
     /// The new cardinality would exceed the capacity of the index type `T`
     /// (e.g. 256 entries for `u8`). The dictionary is left unchanged.
@@ -71,9 +74,10 @@ pub enum DictionaryError {
 impl fmt::Display for DictionaryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            #[cfg(feature = "shared_dict")]
             Self::Shared => write!(
                 f,
-                "dictionary is Shared; growth must be requested through the parent SuperTable / SuperArray"
+                "dictionary is Shared; growth must be requested through the parent CategoryManager"
             ),
             Self::Overflow => write!(
                 f,
@@ -120,7 +124,7 @@ impl<T: Integer> DictionaryInner<T> {
     }
 
     /// Builds from an ordered list of values, preserving the input verbatim
-    /// and rebuilding the index. Codes already minted against `values[i]`
+    /// and rebuilding the index. Codes already assigned against `values[i]`
     /// remain valid because positions are not changed. Panics if the input
     /// length exceeds the capacity of `T`.
     pub fn from_values(values: impl Into<Vec64<String>>) -> Self {
@@ -200,11 +204,13 @@ impl<T: Integer> Deref for DictionaryInner<T> {
 /// Append-only string dictionary in one of two ownership modes.
 ///
 /// - `Owned(DictionaryInner<T>)`: standalone. The owning categorical can mutate
-///   freely via [`Dictionary::intern`].
-/// - `Shared(Arc<DictionaryInner<T>>)`: linked to a canonical dictionary owned
-///   by a parent (`SuperTable` / `SuperArray`). Mutation panics; growth must
-///   be requested through the parent's mediated API so every sibling batch
-///   stays bound to the same canonical Arc.
+///   freely via [`Dictionary::intern`]. This is the only variant available
+///   without the `shared_dict` feature.
+/// - `Shared(Arc<DictionaryInner<T>>)` *(feature: `shared_dict`)*: linked to
+///   a canonical dictionary held by a parent `CategoryManager`. Direct
+///   mutation returns `DictionaryError::Shared`; growth happens via the
+///   manager's `intern` so every sibling batch stays bound to the same
+///   canonical Arc.
 ///
 /// Reads and lookups are uniform across both variants. The `Shared` fast-path
 /// for cross-batch identity is exposed via [`Dictionary::shares_with`], which
@@ -215,6 +221,7 @@ pub enum Dictionary<T: Integer> {
     Owned(DictionaryInner<T>),
     /// Linked view of a canonical dictionary owned by a parent. Immutable
     /// from the categorical's side; growth happens via the parent's API.
+    #[cfg(feature = "shared_dict")]
     Shared(Arc<DictionaryInner<T>>),
 }
 
@@ -247,6 +254,7 @@ impl<T: Integer> Dictionary<T> {
     pub fn values(&self) -> &[String] {
         match self {
             Self::Owned(d) => &d.values,
+            #[cfg(feature = "shared_dict")]
             Self::Shared(a) => &a.values,
         }
     }
@@ -256,6 +264,7 @@ impl<T: Integer> Dictionary<T> {
     pub fn len(&self) -> usize {
         match self {
             Self::Owned(d) => d.len(),
+            #[cfg(feature = "shared_dict")]
             Self::Shared(a) => a.len(),
         }
     }
@@ -271,17 +280,17 @@ impl<T: Integer> Dictionary<T> {
     pub fn lookup(&self, s: &str) -> Option<T> {
         match self {
             Self::Owned(d) => d.lookup(s),
+            #[cfg(feature = "shared_dict")]
             Self::Shared(a) => a.lookup(s),
         }
     }
 
     /// Interns `s`, returning its code.
     ///
-    /// Returns `Err(DictionaryError::Shared)` if this is a `Shared`
-    /// dictionary: growth on a shared dictionary must go through the parent
-    /// (`SuperTable` / `SuperArray`) that owns the canonical, so every
-    /// sibling batch stays coherent. Callers in that situation should route
-    /// the operation through the parent's mediated growth API.
+    /// With the `shared_dict` feature, returns `Err(DictionaryError::Shared)`
+    /// when called on a `Shared` dictionary: growth on a shared dictionary
+    /// must go through the parent `CategoryManager` so every sibling batch
+    /// stays coherent.
     ///
     /// Returns `Err(DictionaryError::Overflow)` if the new cardinality would
     /// exceed the capacity of `T`.
@@ -289,14 +298,23 @@ impl<T: Integer> Dictionary<T> {
     pub fn intern(&mut self, s: &str) -> Result<T, DictionaryError> {
         match self {
             Self::Owned(d) => d.intern(s),
+            #[cfg(feature = "shared_dict")]
             Self::Shared(_) => Err(DictionaryError::Shared),
         }
     }
 
-    /// True if this dictionary is `Shared`.
+    /// True if this dictionary is `Shared`. Always `false` without the
+    /// `shared_dict` feature.
     #[inline]
     pub fn is_shared(&self) -> bool {
-        matches!(self, Self::Shared(_))
+        #[cfg(feature = "shared_dict")]
+        {
+            matches!(self, Self::Shared(_))
+        }
+        #[cfg(not(feature = "shared_dict"))]
+        {
+            false
+        }
     }
 
     /// True if this dictionary is `Owned`.
@@ -306,17 +324,21 @@ impl<T: Integer> Dictionary<T> {
     }
 
     /// True if both dictionaries are `Shared` and point at the same canonical
-    /// (`Arc::ptr_eq` under the hood). Two `Owned` dictionaries are never
-    /// considered shared even if their contents match.
+    /// dictionary (`Arc::ptr_eq` under the hood). Two `Owned` dictionaries
+    /// are never considered shared even if their contents match. Always
+    /// `false` without the `shared_dict` feature.
     #[inline]
     pub fn shares_with(&self, other: &Self) -> bool {
         match (self, other) {
+            #[cfg(feature = "shared_dict")]
             (Self::Shared(a), Self::Shared(b)) => Arc::ptr_eq(a, b),
             _ => false,
         }
     }
 
     /// Returns the inner `Arc` if this is `Shared`, otherwise `None`.
+    /// Only available with the `shared_dict` feature.
+    #[cfg(feature = "shared_dict")]
     #[inline]
     pub fn as_shared(&self) -> Option<&Arc<DictionaryInner<T>>> {
         match self {
@@ -331,13 +353,26 @@ impl<T: Integer> Dictionary<T> {
     pub fn into_owned(self) -> DictionaryInner<T> {
         match self {
             Self::Owned(d) => d,
+            #[cfg(feature = "shared_dict")]
             Self::Shared(a) => (*a).clone(),
+        }
+    }
+
+    /// Borrowing counterpart to `into_owned`: returns a fresh
+    /// `DictionaryInner<T>` regardless of ownership mode. `Owned` is
+    /// cloned in place; `Shared` clones out of the Arc.
+    #[inline]
+    pub fn to_inner(&self) -> DictionaryInner<T> {
+        match self {
+            Self::Owned(d) => d.clone(),
+            #[cfg(feature = "shared_dict")]
+            Self::Shared(a) => (**a).clone(),
         }
     }
 
     /// If this dictionary is `Shared`, copy the snapshot into a private
     /// `Owned` dictionary and replace `self` with it. No-op if already
-    /// `Owned`.
+    /// `Owned`. No-op without the `shared_dict` feature.
     ///
     /// Mutating call-sites use this so they never have to return a
     /// `Shared` error. The categorical's existing codes still mean the same
@@ -347,15 +382,18 @@ impl<T: Integer> Dictionary<T> {
     /// A `log::warn` is emitted so the caller can find where this happened
     /// and silence or filter it if expected.
     pub fn demote_to_owned(&mut self) {
-        if let Self::Shared(arc) = self {
-            log::warn!(
-                target: "minarrow::dictionary",
-                "Categorical dictionary was Shared and is now Owned. \
-                 Any new values added from here will not be seen by other \
-                 categoricals that held the same shared dictionary."
-            );
-            let owned = (**arc).clone();
-            *self = Self::Owned(owned);
+        #[cfg(feature = "shared_dict")]
+        {
+            if let Self::Shared(arc) = self {
+                log::warn!(
+                    target: "minarrow::dictionary",
+                    "Categorical dictionary was Shared and is now Owned. \
+                     Any new values added from here will not be seen by other \
+                     categoricals that held the same shared dictionary."
+                );
+                let owned = (**arc).clone();
+                *self = Self::Owned(owned);
+            }
         }
     }
 
@@ -401,17 +439,18 @@ impl<T: Integer, S: Into<String>> FromIterator<S> for Dictionary<T> {
 
 /// # CategoryManager
 ///
-/// Owns the canonical dictionary for a single categorical column on behalf
-/// of a parent container (`SuperTable` / `SuperArray`), or for a set of
-/// peer-linked standalone categoricals (`sync_dict`).
+/// Writer-side handle for a single categorical column's canonical dictionary,
+/// held by a parent container (typically `SuperTable`). Children point at a
+/// `Dictionary::Shared` snapshot of the same dictionary and never consult
+/// the manager on read paths.
 ///
 /// ## Concurrency model
 ///
 /// `intern(&self, value)` may be called concurrently from multiple threads.
-/// The canonical is stored as `Arc<DictionaryInner<T>>` so children's
-/// `Shared` snapshots are immutable Arc clones. Growth replaces the Arc;
-/// existing snapshots remain valid against any new superset Arc by the
-/// append-only invariant.
+/// The canonical dictionary is stored as `Arc<DictionaryInner<T>>` so
+/// children's `Shared` snapshots are immutable Arc clones. Growth replaces
+/// the Arc; existing snapshots remain valid against any new superset Arc by
+/// the append-only invariant.
 ///
 /// ## Storage backends
 ///
@@ -423,13 +462,15 @@ impl<T: Integer, S: Into<String>> FromIterator<S> for Dictionary<T> {
 ///   Growth uses a CAS-retry loop; no lock acquired. Use when concurrent
 ///   novel-value insertion is a hot path (heavy multi-thread ingestion of
 ///   genuinely new strings).
+#[cfg(feature = "shared_dict")]
 pub struct CategoryManager<T: Integer> {
     #[cfg(not(feature = "contended_dict"))]
-    canonical: std::sync::Mutex<Arc<DictionaryInner<T>>>,
+    cat_dict: std::sync::Mutex<Arc<DictionaryInner<T>>>,
     #[cfg(feature = "contended_dict")]
-    canonical: arc_swap::ArcSwap<DictionaryInner<T>>,
+    cat_dict: arc_swap::ArcSwap<DictionaryInner<T>>,
 }
 
+#[cfg(feature = "shared_dict")]
 impl<T: Integer> CategoryManager<T> {
     /// Empty manager.
     pub fn new() -> Self {
@@ -437,19 +478,19 @@ impl<T: Integer> CategoryManager<T> {
     }
 
     /// Construct from an existing dictionary. Used by parents when absorbing
-    /// a batch's `Owned` dictionary into the canonical for the first time.
+    /// a batch's `Owned` dictionary into the canonical store for the first time.
     pub fn from_inner(inner: DictionaryInner<T>) -> Self {
         let arc = Arc::new(inner);
         #[cfg(not(feature = "contended_dict"))]
         {
             Self {
-                canonical: std::sync::Mutex::new(arc),
+                cat_dict: std::sync::Mutex::new(arc),
             }
         }
         #[cfg(feature = "contended_dict")]
         {
             Self {
-                canonical: arc_swap::ArcSwap::from(arc),
+                cat_dict: arc_swap::ArcSwap::from(arc),
             }
         }
     }
@@ -459,25 +500,51 @@ impl<T: Integer> CategoryManager<T> {
     pub fn snapshot(&self) -> Arc<DictionaryInner<T>> {
         #[cfg(not(feature = "contended_dict"))]
         {
-            Arc::clone(&*self.canonical.lock().expect("canonical mutex poisoned"))
+            Arc::clone(&*self.cat_dict.lock().expect("category manager dictionary poisoned"))
         }
         #[cfg(feature = "contended_dict")]
         {
-            self.canonical.load_full()
+            self.cat_dict.load_full()
         }
     }
 
-    /// Intern `value` into the canonical and return its code.
+    /// Intern every entry of `cat`'s dictionary into this manager. If any
+    /// code shifts under the union, remap `cat`'s data buffer to the new
+    /// codes. Rebind `cat`'s dictionary to a fresh `Shared` snapshot of
+    /// the manager.
+    ///
+    /// Used by `CategoryDispatch::absorb` once it has matched the manager
+    /// against the array's width. `T` agrees on both sides by construction.
+    pub(crate) fn absorb(&self, cat: &mut crate::CategoricalArray<T>) {
+        let values = cat.dictionary.values();
+        let mut shifted = false;
+        let mut remap: Vec<T> = Vec::with_capacity(values.len());
+        for (incoming, s) in values.iter().enumerate() {
+            let Ok(new_code) = self.intern(s) else { return };
+            if new_code.to_usize() != incoming {
+                shifted = true;
+            }
+            remap.push(new_code);
+        }
+        if shifted {
+            for code in cat.data.iter_mut() {
+                *code = remap[code.to_usize()];
+            }
+        }
+        cat.dictionary = Dictionary::Shared(self.snapshot());
+    }
+
+    /// Intern `value` and return its code.
     ///
     /// Concurrent-safe via `&self`. The default backend takes the mutex,
     /// looks up, and either returns the existing code or clones-extends-swaps
-    /// the canonical Arc — all under the lock so observers are consistent.
+    /// the canonical Arc - all under the lock so observers are consistent.
     /// The `contended_dict` backend does the same logic via a lock-free
     /// CAS-retry loop on the canonical Arc.
     pub fn intern(&self, value: &str) -> Result<T, DictionaryError> {
         #[cfg(not(feature = "contended_dict"))]
         {
-            let mut guard = self.canonical.lock().expect("canonical mutex poisoned");
+            let mut guard = self.cat_dict.lock().expect("category manager dictionary poisoned");
             if let Some(code) = guard.lookup(value) {
                 return Ok(code);
             }
@@ -490,41 +557,44 @@ impl<T: Integer> CategoryManager<T> {
         #[cfg(feature = "contended_dict")]
         {
             loop {
-                let current = self.canonical.load();
+                let current = self.cat_dict.load();
                 if let Some(code) = current.lookup(value) {
                     return Ok(code);
                 }
                 let mut new_inner: DictionaryInner<T> = (**current).clone();
                 let code = new_inner.intern(value)?;
                 let new_arc = Arc::new(new_inner);
-                let prev = self.canonical.compare_and_swap(&*current, new_arc);
+                let prev = self.cat_dict.compare_and_swap(&*current, new_arc);
                 if Arc::ptr_eq(&prev, &*current) {
                     return Ok(code);
                 }
-                // CAS lost — another writer interned concurrently. Retry:
+                // CAS lost - another writer interned concurrently. Retry:
                 // on the next pass we will either find `value` already
                 // present (returns existing code) or extend off the new
-                // canonical.
+                // canonical Arc.
             }
         }
     }
 }
 
+#[cfg(feature = "shared_dict")]
 impl<T: Integer> Default for CategoryManager<T> {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(feature = "shared_dict")]
 impl<T: Integer> Clone for CategoryManager<T> {
-    /// Clones the manager by taking a snapshot of the canonical and wrapping
-    /// it in a fresh backing store. The clone is independent of the original:
+    /// Clones the manager by taking a snapshot of the store and wrapping
+    /// it in a fresh backing. The clone is independent of the original:
     /// future growth on either side is not visible to the other.
     fn clone(&self) -> Self {
         Self::from_inner((*self.snapshot()).clone())
     }
 }
 
+#[cfg(feature = "shared_dict")]
 impl<T: Integer> std::fmt::Debug for CategoryManager<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let snap = self.snapshot();
@@ -538,8 +608,10 @@ impl<T: Integer> std::fmt::Debug for CategoryManager<T> {
 ///
 /// `CategoryManager` width-erased across index types so a parent container
 /// (`SuperTable`) can hold one entry per categorical column without being
-/// generic over each column's width. Parents pattern-match on this to reach
-/// the typed manager and call its `intern` / `snapshot` methods.
+/// generic over each column's width. All operations against a column's
+/// dispatch are exposed as methods on this enum; each method matches the
+/// variant once and proceeds with the typed manager from there.
+#[cfg(feature = "shared_dict")]
 #[derive(Debug, Clone)]
 pub enum CategoryDispatch {
     #[cfg(feature = "default_categorical_8")]
@@ -550,6 +622,94 @@ pub enum CategoryDispatch {
     U32(CategoryManager<u32>),
     #[cfg(feature = "extended_categorical")]
     U64(CategoryManager<u64>),
+}
+
+#[cfg(feature = "shared_dict")]
+impl CategoryDispatch {
+    /// Install a fresh dispatch from a batch's categorical column. The
+    /// array's existing dictionary becomes the manager's canonical, and
+    /// the array is rebound to a `Shared` snapshot of it.
+    ///
+    /// Returns `None` if the array is not categorical at any enabled width.
+    pub fn install_from(array: &mut crate::Array) -> Option<Self> {
+        use crate::{Array, TextArray};
+        match array {
+            #[cfg(any(not(feature = "default_categorical_8"), feature = "extended_categorical"))]
+            Array::TextArray(TextArray::Categorical32(arc)) => {
+                let cat = Arc::make_mut(arc);
+                let manager = CategoryManager::<u32>::from_inner(cat.dictionary.to_inner());
+                cat.dictionary = Dictionary::Shared(manager.snapshot());
+                Some(CategoryDispatch::U32(manager))
+            }
+            #[cfg(feature = "default_categorical_8")]
+            Array::TextArray(TextArray::Categorical8(arc)) => {
+                let cat = Arc::make_mut(arc);
+                let manager = CategoryManager::<u8>::from_inner(cat.dictionary.to_inner());
+                cat.dictionary = Dictionary::Shared(manager.snapshot());
+                Some(CategoryDispatch::U8(manager))
+            }
+            #[cfg(feature = "extended_categorical")]
+            Array::TextArray(TextArray::Categorical16(arc)) => {
+                let cat = Arc::make_mut(arc);
+                let manager = CategoryManager::<u16>::from_inner(cat.dictionary.to_inner());
+                cat.dictionary = Dictionary::Shared(manager.snapshot());
+                Some(CategoryDispatch::U16(manager))
+            }
+            #[cfg(feature = "extended_categorical")]
+            Array::TextArray(TextArray::Categorical64(arc)) => {
+                let cat = Arc::make_mut(arc);
+                let manager = CategoryManager::<u64>::from_inner(cat.dictionary.to_inner());
+                cat.dictionary = Dictionary::Shared(manager.snapshot());
+                Some(CategoryDispatch::U64(manager))
+            }
+            _ => None,
+        }
+    }
+
+    /// Intern every entry of `array`'s dictionary into this dispatch's
+    /// manager. If any code shifts under the union, remap the array's
+    /// data buffer to the new codes. Rebind the array to the manager's
+    /// resulting snapshot.
+    ///
+    /// The dispatch variant and the array's categorical width must agree;
+    /// any other pairing is a schema mismatch upstream and is treated as
+    /// a no-op here.
+    pub fn absorb(&self, array: &mut crate::Array) {
+        use crate::{Array, TextArray};
+        match (self, array) {
+            #[cfg(any(not(feature = "default_categorical_8"), feature = "extended_categorical"))]
+            (CategoryDispatch::U32(m), Array::TextArray(TextArray::Categorical32(arc))) => {
+                m.absorb(Arc::make_mut(arc));
+            }
+            #[cfg(feature = "default_categorical_8")]
+            (CategoryDispatch::U8(m), Array::TextArray(TextArray::Categorical8(arc))) => {
+                m.absorb(Arc::make_mut(arc));
+            }
+            #[cfg(feature = "extended_categorical")]
+            (CategoryDispatch::U16(m), Array::TextArray(TextArray::Categorical16(arc))) => {
+                m.absorb(Arc::make_mut(arc));
+            }
+            #[cfg(feature = "extended_categorical")]
+            (CategoryDispatch::U64(m), Array::TextArray(TextArray::Categorical64(arc))) => {
+                m.absorb(Arc::make_mut(arc));
+            }
+            _ => {}
+        }
+    }
+
+    /// Number of strings currently in the manager's canonical dictionary.
+    pub fn len(&self) -> usize {
+        match self {
+            #[cfg(feature = "default_categorical_8")]
+            CategoryDispatch::U8(m) => m.snapshot().len(),
+            #[cfg(feature = "extended_categorical")]
+            CategoryDispatch::U16(m) => m.snapshot().len(),
+            #[cfg(any(not(feature = "default_categorical_8"), feature = "extended_categorical"))]
+            CategoryDispatch::U32(m) => m.snapshot().len(),
+            #[cfg(feature = "extended_categorical")]
+            CategoryDispatch::U64(m) => m.snapshot().len(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -591,6 +751,7 @@ mod tests {
         assert_eq!(d.lookup("c"), Some(3));
     }
 
+    #[cfg(feature = "shared_dict")]
     #[test]
     fn shared_dictionaries_compare_by_arc_pointer() {
         let inner = DictionaryInner::<u32>::from_values(Vec64::from(vec![
@@ -609,6 +770,7 @@ mod tests {
         assert!(!a.shares_with(&c));
     }
 
+    #[cfg(feature = "shared_dict")]
     #[test]
     fn intern_on_shared_returns_shared_error() {
         let inner = DictionaryInner::<u32>::from_values(Vec64::from(vec!["a".to_string()]));
@@ -616,6 +778,7 @@ mod tests {
         assert_eq!(d.intern("b"), Err(DictionaryError::Shared));
     }
 
+    #[cfg(feature = "shared_dict")]
     #[test]
     fn into_owned_clones_shared_state() {
         let inner = DictionaryInner::<u32>::from_values(Vec64::from(vec![
@@ -649,6 +812,7 @@ mod tests {
         assert_eq!(d.len(), 256);
     }
 
+    #[cfg(feature = "shared_dict")]
     #[test]
     fn category_manager_serial_intern() {
         let m: CategoryManager<u32> = CategoryManager::new();
@@ -660,6 +824,7 @@ mod tests {
         assert_eq!(snap.values.as_slice(), &["a", "b"]);
     }
 
+    #[cfg(feature = "shared_dict")]
     #[test]
     fn category_manager_concurrent_intern() {
         use std::sync::Arc as StdArc;
