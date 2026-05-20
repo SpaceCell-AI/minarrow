@@ -466,11 +466,32 @@ impl Bitmask {
     }
 
     /// Resizes mask to new_len. New bits set or cleared per `set`.
+    ///
+    /// Bit-correct across a partial old-byte boundary when extending: the
+    /// byte-level resize only fills *newly added* bytes, so bits in
+    /// `[old_len..next_byte_boundary)` would otherwise be untouched and stay
+    /// at the value the prior `mask_trailing_bits` left them (0). When
+    /// `set` is true those bits are flipped explicitly so the extension
+    /// honours the documented contract regardless of byte alignment.
     pub fn resize(&mut self, new_len: usize, set: bool) {
+        let old_len = self.len;
         let new_bytes = (new_len + 7) / 8;
         let fill = if set { 0xFF } else { 0 };
         self.bits.resize(new_bytes, fill);
         self.len = new_len;
+
+        // Extension across a non-byte-aligned old_len: set=true must reach
+        // the bits in the old partial byte. For set=false the class
+        // invariant already keeps those bits at 0.
+        if set && new_len > old_len && (old_len & 7) != 0 {
+            let byte_boundary = ((old_len + 7) / 8) * 8;
+            let limit = new_len.min(byte_boundary);
+            for i in old_len..limit {
+                // SAFETY: i < limit <= new_len = self.len, byte already exists.
+                unsafe { self.set_unchecked(i, true) };
+            }
+        }
+
         self.mask_trailing_bits();
     }
 
@@ -974,6 +995,33 @@ mod tests {
         assert!(m.get(3));
         m.set(3, false);
         assert!(!m.get(3));
+    }
+
+    #[test]
+    fn test_resize_extend_with_true_across_partial_byte() {
+        // Mask of len 5: bits 0-4 set, bits 5-7 cleared by mask_trailing_bits.
+        let mut m = Bitmask::new_set_all(5, true);
+        assert_eq!(m.len(), 5);
+        for i in 0..5 {
+            assert!(m.get(i), "bit {} should be set before resize", i);
+        }
+
+        // Extending with set=true must set bits 5..8 to 1 even though they
+        // lie inside the old partial byte that the byte-level fill cannot
+        // reach.
+        m.resize(8, true);
+        assert_eq!(m.len(), 8);
+        for i in 0..8 {
+            assert!(m.get(i), "bit {} should be set after resize(8, true)", i);
+        }
+
+        // Extension that crosses a byte boundary: bits 5..12 must all be 1.
+        let mut m = Bitmask::new_set_all(5, true);
+        m.resize(12, true);
+        assert_eq!(m.len(), 12);
+        for i in 0..12 {
+            assert!(m.get(i), "bit {} should be set after resize(12, true)", i);
+        }
     }
 
     #[test]
