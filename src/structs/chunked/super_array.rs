@@ -46,6 +46,8 @@ use crate::ArrayV;
 use crate::SuperArrayV;
 use crate::enums::{error::MinarrowError, shape_dim::ShapeDim};
 use crate::ffi::arrow_dtype::ArrowType;
+#[cfg(feature = "shared_dict")]
+use crate::structs::dictionary::CategoryDispatch;
 #[cfg(feature = "size")]
 use crate::traits::byte_size::ByteSize;
 use crate::traits::consolidate::Consolidate;
@@ -100,7 +102,7 @@ pub enum RechunkStrategy {
 /// let sa = SuperArray::from_field_array_chunks(vec![fa1, fa2]);
 /// assert_eq!(sa.field().unwrap().name, fa1.field.name);
 /// ```
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct SuperArray {
     /// The underlying array chunks.
     pub chunks: Vec<Array>,
@@ -108,6 +110,23 @@ pub struct SuperArray {
     pub field: Option<Arc<Field>>,
     /// Optional null counts per chunk. If present, must have same length as `chunks`.
     pub null_counts: Option<Vec<usize>>,
+    /// `CategoryManager` for this column when its type is categorical and
+    /// `shared_dict` is enabled. Owns the dictionary that every chunk's
+    /// `Dictionary::Shared` snapshot points at. New values are added by
+    /// calling `intern` on the typed manager reached via
+    /// `category_dispatch()`; this is safe to call from multiple threads.
+    #[cfg(feature = "shared_dict")]
+    pub(crate) category_manager: Option<CategoryDispatch>,
+}
+
+impl PartialEq for SuperArray {
+    /// Equality compares chunk data, field metadata, and null counts. The
+    /// `category_manager` is derived from `chunks` and not compared.
+    fn eq(&self, other: &Self) -> bool {
+        self.chunks == other.chunks
+            && self.field == other.field
+            && self.null_counts == other.null_counts
+    }
 }
 
 impl SuperArray {
@@ -120,6 +139,8 @@ impl SuperArray {
             chunks: Vec::new(),
             field: None,
             null_counts: None,
+            #[cfg(feature = "shared_dict")]
+            category_manager: None,
         }
     }
 
@@ -142,11 +163,17 @@ impl SuperArray {
                 );
             }
         }
-        Self {
+        #[cfg_attr(not(feature = "shared_dict"), allow(unused_mut))]
+        let mut sa = Self {
             chunks,
             field: None,
             null_counts: None,
-        }
+            #[cfg(feature = "shared_dict")]
+            category_manager: None,
+        };
+        #[cfg(feature = "shared_dict")]
+        sa.rebuild_category_manager();
+        sa
     }
 
     /// Constructs a SuperArray from raw `Array` chunks with field metadata.
@@ -168,11 +195,17 @@ impl SuperArray {
             );
         }
 
-        Self {
+        #[cfg_attr(not(feature = "shared_dict"), allow(unused_mut))]
+        let mut sa = Self {
             chunks,
             field: Some(field),
             null_counts: None,
-        }
+            #[cfg(feature = "shared_dict")]
+            category_manager: None,
+        };
+        #[cfg(feature = "shared_dict")]
+        sa.rebuild_category_manager();
+        sa
     }
 
     /// Constructs a SuperArray from raw `Array` chunks with null counts.
@@ -201,11 +234,17 @@ impl SuperArray {
             }
         }
 
-        Self {
+        #[cfg_attr(not(feature = "shared_dict"), allow(unused_mut))]
+        let mut sa = Self {
             chunks,
             field: None,
             null_counts: Some(null_counts),
-        }
+            #[cfg(feature = "shared_dict")]
+            category_manager: None,
+        };
+        #[cfg(feature = "shared_dict")]
+        sa.rebuild_category_manager();
+        sa
     }
 
     /// Constructs a SuperArray from `FieldArray` chunks.
@@ -242,11 +281,17 @@ impl SuperArray {
         let null_counts: Vec<usize> = chunks.iter().map(|fa| fa.null_count).collect();
         let arrays = chunks.into_iter().map(|fa| fa.array).collect();
 
-        Self {
+        #[cfg_attr(not(feature = "shared_dict"), allow(unused_mut))]
+        let mut sa = Self {
             chunks: arrays,
             field: Some(field),
             null_counts: Some(null_counts),
-        }
+            #[cfg(feature = "shared_dict")]
+            category_manager: None,
+        };
+        #[cfg(feature = "shared_dict")]
+        sa.rebuild_category_manager();
+        sa
     }
 
     /// Construct from `Vec<FieldArray>`.
@@ -282,11 +327,17 @@ impl SuperArray {
             null_counts.push(view.null_count());
         }
 
-        Self {
+        #[cfg_attr(not(feature = "shared_dict"), allow(unused_mut))]
+        let mut sa = Self {
             chunks: arrays,
             field: Some(field),
             null_counts: Some(null_counts),
-        }
+            #[cfg(feature = "shared_dict")]
+            category_manager: None,
+        };
+        #[cfg(feature = "shared_dict")]
+        sa.rebuild_category_manager();
+        sa
     }
 
     /// Returns a zero-copy view of this chunked array over the window `[offset..offset+len)`.
@@ -442,6 +493,10 @@ impl SuperArray {
         if let Some(ref mut nc) = self.null_counts {
             nc.push(chunk.null_count());
         }
+        #[cfg_attr(not(feature = "shared_dict"), allow(unused_mut))]
+        let mut chunk = chunk;
+        #[cfg(feature = "shared_dict")]
+        self.absorb_one(&mut chunk);
         self.chunks.push(chunk);
     }
 
@@ -462,6 +517,10 @@ impl SuperArray {
                 "Chunk ArrowType mismatch with field"
             );
         }
+        #[cfg_attr(not(feature = "shared_dict"), allow(unused_mut))]
+        let mut chunk = chunk;
+        #[cfg(feature = "shared_dict")]
+        self.absorb_one(&mut chunk);
         self.chunks.push(chunk);
         if let Some(ref mut nc) = self.null_counts {
             nc.push(null_count);
@@ -497,7 +556,11 @@ impl SuperArray {
             self.field = Some(chunk.field.clone());
         }
 
-        self.chunks.push(chunk.array);
+        #[cfg_attr(not(feature = "shared_dict"), allow(unused_mut))]
+        let mut array = chunk.array;
+        #[cfg(feature = "shared_dict")]
+        self.absorb_one(&mut array);
+        self.chunks.push(array);
         if let Some(ref mut nc) = self.null_counts {
             nc.push(chunk.null_count);
         } else {
@@ -895,6 +958,53 @@ impl SuperArray {
     pub fn chunks(&self) -> &[Array] {
         &self.chunks
     }
+
+    /// Borrow the `CategoryDispatch` for this column, or `None` if the
+    /// column is not categorical or no chunks have been pushed yet. The
+    /// caller matches on the dispatch variant to reach the width-typed
+    /// `CategoryManager` and call `intern` / `snapshot` on it.
+    ///
+    /// This is the entry point for live ingestion against a categorical
+    /// SuperArray that has already absorbed chunks: the manager extends
+    /// the shared dictionary once and every sibling chunk's snapshot
+    /// remains coherent under the append-only invariant.
+    #[cfg(feature = "shared_dict")]
+    #[inline]
+    pub fn category_dispatch(&self) -> Option<&CategoryDispatch> {
+        self.category_manager.as_ref()
+    }
+
+    /// Absorb one categorical chunk into the SuperArray's per-column
+    /// dispatch. Non-categorical chunks are no-ops. All width-specific
+    /// work lives behind `CategoryDispatch::absorb` /
+    /// `CategoryDispatch::install_from`.
+    #[cfg(feature = "shared_dict")]
+    fn absorb_one(&mut self, chunk: &mut Array) {
+        match &mut self.category_manager {
+            Some(dispatch) => dispatch.absorb(chunk),
+            slot @ None => *slot = CategoryDispatch::install_from(chunk),
+        }
+    }
+
+    /// Rebuild `category_manager` from the current `chunks`. Used by
+    /// constructors that take a `Vec<Array>` upfront and need to set up
+    /// the manager afterwards. The first chunk's dictionary is taken as
+    /// the starting state; subsequent chunks' dictionaries are folded in
+    /// by the same logic as `push`.
+    #[cfg(feature = "shared_dict")]
+    pub(crate) fn rebuild_category_manager(&mut self) {
+        self.category_manager = None;
+        if self.chunks.is_empty() {
+            return;
+        }
+        let chunks = std::mem::take(&mut self.chunks);
+        let mut rebuilt: Vec<Array> = Vec::with_capacity(chunks.len());
+        for mut chunk in chunks {
+            self.absorb_one(&mut chunk);
+            rebuilt.push(chunk);
+        }
+        self.chunks = rebuilt;
+    }
 }
 
 impl Default for SuperArray {
@@ -926,11 +1036,17 @@ impl FromIterator<FieldArray> for SuperArray {
 // Single chunk with field metadata
 impl From<FieldArray> for SuperArray {
     fn from(fa: FieldArray) -> Self {
-        SuperArray {
+        #[cfg_attr(not(feature = "shared_dict"), allow(unused_mut))]
+        let mut sa = SuperArray {
             chunks: vec![fa.array],
             field: Some(fa.field),
             null_counts: Some(vec![fa.null_count]),
-        }
+            #[cfg(feature = "shared_dict")]
+            category_manager: None,
+        };
+        #[cfg(feature = "shared_dict")]
+        sa.rebuild_category_manager();
+        sa
     }
 }
 
@@ -939,11 +1055,17 @@ impl From<FieldArray> for SuperArray {
 // Single chunk without field metadata
 impl From<Array> for SuperArray {
     fn from(array: Array) -> Self {
-        SuperArray {
+        #[cfg_attr(not(feature = "shared_dict"), allow(unused_mut))]
+        let mut sa = SuperArray {
             chunks: vec![array],
             field: None,
             null_counts: None,
-        }
+            #[cfg(feature = "shared_dict")]
+            category_manager: None,
+        };
+        #[cfg(feature = "shared_dict")]
+        sa.rebuild_category_manager();
+        sa
     }
 }
 
@@ -1089,11 +1211,17 @@ impl Concatenate for SuperArray {
             _ => None,
         };
 
-        Ok(SuperArray {
+        #[cfg_attr(not(feature = "shared_dict"), allow(unused_mut))]
+        let mut sa = SuperArray {
             chunks: result_chunks,
             field: self.field.or(other.field),
             null_counts,
-        })
+            #[cfg(feature = "shared_dict")]
+            category_manager: None,
+        };
+        #[cfg(feature = "shared_dict")]
+        sa.rebuild_category_manager();
+        Ok(sa)
     }
 }
 
@@ -1659,6 +1787,77 @@ mod tests {
             assert_eq!(&*ia.data, &[10, 20, 30, 40, 50, 60]);
         } else {
             panic!("Expected Int32");
+        }
+    }
+
+    /// Pushing categorical chunks into a SuperArray installs a manager on
+    /// the first push and absorbs subsequent chunks against it. Both
+    /// chunks become `Shared`; the earlier chunk's snapshot is a prefix
+    /// of the later one (append-only invariant), and the manager carries
+    /// the union of all entries.
+    #[cfg(all(
+        feature = "shared_dict",
+        any(not(feature = "default_categorical_8"), feature = "extended_categorical")
+    ))]
+    #[test]
+    fn test_shared_dict_absorb_across_pushes() {
+        use crate::TextArray;
+        use crate::arr_cat32;
+        use crate::structs::dictionary::Dictionary;
+
+        let chunk1: Array = arr_cat32!("a", "b", "a");
+        let chunk2: Array = arr_cat32!("b", "c", "a");
+
+        let mut sa = SuperArray::new();
+        sa.push(chunk1);
+        sa.push(chunk2);
+
+        // Snapshot reads inside dedicated scopes so the immutable borrows
+        // do not collide with the third `push` below.
+        let (d1_snapshot, d1_values): (Dictionary<u32>, Vec<String>);
+        {
+            let d0 = match &sa.chunks[0] {
+                Array::TextArray(TextArray::Categorical32(a)) => &a.dictionary,
+                _ => panic!("expected Categorical32"),
+            };
+            let d1 = match &sa.chunks[1] {
+                Array::TextArray(TextArray::Categorical32(a)) => &a.dictionary,
+                _ => panic!("expected Categorical32"),
+            };
+            // Both chunks bind to a Shared snapshot. The first chunk's
+            // snapshot ({a, b}) is a prefix of the second's ({a, b, c}) by
+            // the append-only invariant, so codes assigned against chunk 0
+            // still decode correctly against chunk 1's dictionary.
+            assert!(matches!(d0, Dictionary::Shared(_)));
+            assert!(matches!(d1, Dictionary::Shared(_)));
+            assert_eq!(d0.values(), &["a", "b"]);
+            assert_eq!(d1.values(), &["a", "b", "c"]);
+            assert!(d0.is_prefix_of(d1));
+            d1_snapshot = d1.clone();
+            d1_values = d1.values().to_vec();
+        }
+
+        // When the next push introduces no new entries the manager's Arc
+        // is not rotated, so the new chunk's snapshot is pointer-equal
+        // to the previous one.
+        let chunk3: Array = arr_cat32!("a", "b");
+        sa.push(chunk3);
+        let d2 = match &sa.chunks[2] {
+            Array::TextArray(TextArray::Categorical32(a)) => &a.dictionary,
+            _ => panic!("expected Categorical32"),
+        };
+        assert_eq!(d2.values(), d1_values.as_slice());
+        assert!(d1_snapshot.shares_with(d2));
+
+        // category_dispatch returns Some and interning a known value is idempotent.
+        let dispatch = sa.category_dispatch().expect("dispatch present after push");
+        match dispatch {
+            CategoryDispatch::U32(m) => {
+                assert_eq!(m.intern("a"), Ok(0));
+                assert_eq!(m.intern("b"), Ok(1));
+                assert_eq!(m.intern("c"), Ok(2));
+            }
+            _ => panic!("expected U32 dispatch"),
         }
     }
 }
