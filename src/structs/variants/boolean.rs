@@ -138,7 +138,9 @@ impl BooleanArray<()> {
         Self {
             data: Bitmask::with_capacity(cap),
             null_mask: if null_mask {
-                Some(Bitmask::with_capacity(cap))
+                // All-valid (1) default - reserved validity slots default to
+                // valid under Arrow's 1=valid, 0=null convention.
+                Some(Bitmask::new_set_all(cap, true))
             } else {
                 None
             },
@@ -540,17 +542,16 @@ impl MaskedArray for BooleanArray<()> {
     #[inline]
     fn push_nulls(&mut self, n: usize) {
         let start = self.len;
-        self.data.resize(start + n, false);
+        let end = start + n;
+        self.data.resize(end, false);
         if let Some(nm) = &mut self.null_mask {
-            nm.resize(start + n, false);
+            nm.set_range(start, end, false);
         } else {
-            let mut nm = Bitmask::new_set_all(start + n, true);
-            for i in start..start + n {
-                nm.set(i, false);
-            }
+            let mut nm = Bitmask::new_set_all(end, true);
+            nm.set_range(start, end, false);
             self.null_mask = Some(nm);
         }
-        self.len += n;
+        self.len = end;
     }
 
     /// Appends a null value to the array without bounds or consistency checks.
@@ -1016,11 +1017,21 @@ mod tests {
         assert!(arr.data.is_empty());
         assert!(arr.null_mask.is_none());
 
-        let arr = BooleanArray::with_capacity(100, true);
+        let mut arr = BooleanArray::with_capacity(100, true);
         assert_eq!(arr.len(), 0);
         assert_eq!(arr.data.capacity(), 100); // logical bits reserved
         assert!(arr.null_mask.is_some());
         assert_eq!(arr.null_mask.as_ref().unwrap().capacity(), 100);
+
+        // Reserved null-mask slots must default to valid (1).
+        assert_eq!(arr.null_count(), 0);
+
+        arr.push(true);
+        arr.push(false);
+        assert_eq!(arr.null_count(), 0);
+
+        arr.push_null();
+        assert_eq!(arr.null_count(), 1);
     }
 
     #[test]
