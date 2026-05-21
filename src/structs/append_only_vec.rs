@@ -12,276 +12,192 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! # **AppendOnlyVec** - *Lock-free Append-only Vec with Stable Element Addresses*
+//! # **AppendOnlyVec** - *Contiguous Lock-free Append-only Vec*
 //!
 //! Used internally by `Dictionary<T>` as the code-indexed value array.
-//! Elements live in bucketed heap allocations that are never moved or
-//! freed during the vector's lifetime, so `&T` references survive
-//! subsequent pushes - which lets `Dictionary` hand out `&str` borrows
-//! tied to `&self` without holding any read lock.
+//! Storage is a single contiguous allocation sized at construction;
+//! the buffer is never reallocated, so element addresses are stable
+//! for the vector's lifetime. `Dictionary` hands out `&str` borrows
+//! tied to `&self` against the published prefix without any reader-side
+//! lock or guard.
 //!
 //! ## Concurrency model
-//! - **Multi-reader concurrent**: `get` / `iter` are lock-free; readers
-//!   see only fully-published slots via an `Acquire` load on each slot's
-//!   `init` flag.
-//! - **Multi-writer concurrent**: `push` and `push_bounded` are `&self`
-//!   and safe to call from multiple threads simultaneously. Slot
-//!   assignment is via a CAS-or-`fetch_add` on a global `reserved`
-//!   counter; each writer claims a distinct slot and publishes it
-//!   independently. No writer blocks another.
+//! - **Reads**: lock-free. `as_slice` / `get` / `iter` read the prefix
+//!   `[0, published)` via an `Acquire` load on the publish counter,
+//!   then access the contiguous buffer directly.
+//! - **Writes**: lock-free. A writer claims a slot via a cap-bounded
+//!   `compare_exchange_weak` loop on `reserved`, writes the value
+//!   into its slot, then briefly spins on the `published` counter
+//!   waiting for predecessors to commit before `Release`-storing its
+//!   own commit. No mutex is taken on either path; cache-hit interns
+//!   in `Dictionary` never reach the value array at all (sharded
+//!   reverse-lookup map deals with them).
 //!
-//! ## Allocation strategy
-//! Buckets at doubling sizes starting at 16. Bucket `i` holds `16 << i`
-//! entries; 28 buckets cover ~4 billion entries (greater than `u32::MAX`,
-//! the widest categorical index Minarrow targets).
+//! ## Capacity
+//! Fixed at construction. `push` returns `None` once the cap is
+//! reached; the cap check sits inside the `reserved` CAS loop, so the
+//! narrow-width categorical caps (u8 → 256, u16 → 65 536, ...) are
+//! honoured exactly even under heavy multi-writer contention - a
+//! failed CAS never advances the counter, so no slot is leaked.
 
-use std::alloc::{Layout, alloc, dealloc};
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
-use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// First bucket holds 16 entries.
-const FIRST_BUCKET: usize = 16;
-/// 28 buckets cover 16 * (2^28 - 1) entries, > u32::MAX.
-const N_BUCKETS: usize = 28;
-
-/// Per-slot storage. `init` distinguishes fully-published slots (writer
-/// has finished writing) from reserved-but-not-yet-published ones.
-struct Slot<T> {
-    init: AtomicBool,
-    value: UnsafeCell<MaybeUninit<T>>,
-}
-
-/// Lock-free append-only Vec with stable element addresses. See module docs.
+/// Lock-free append-only vector with a fixed contiguous buffer. See
+/// module documentation for the concurrency model.
 pub struct AppendOnlyVec<T> {
-    /// Bucket pointers. Each entry is either null (bucket not allocated)
-    /// or points to an array of `bucket_size(i)` `Slot<T>` entries with
-    /// `init=false` and `value` uninitialised at allocation time.
-    buckets: [AtomicPtr<Slot<T>>; N_BUCKETS],
-    /// Number of slots claimed by writers. May exceed the number of
-    /// fully-published slots if writes are in flight; readers must
-    /// consult each slot's `init` flag before dereferencing.
+    /// Pre-allocated slot buffer. Length is fixed at construction;
+    /// never resized. Slots at indices `[0, published)` are fully
+    /// initialised; later indices are `MaybeUninit`.
+    slots: Box<[UnsafeCell<MaybeUninit<T>>]>,
+    /// Slot claims. Writers advance via a cap-bounded
+    /// `compare_exchange_weak` loop; a failed CAS leaves the counter
+    /// untouched, so the cap is enforced exactly.
     reserved: AtomicUsize,
+    /// Published prefix length. Writers commit by `Release`-storing
+    /// `idx + 1` once their predecessors have committed; readers see
+    /// only the published prefix via `Acquire` loads. The published
+    /// prefix is always contiguous - readers can return `&[T]`
+    /// covering it directly.
+    published: AtomicUsize,
 }
 
 impl<T> Default for AppendOnlyVec<T> {
+    /// Empty vector with zero capacity. Use [`with_capacity`] to size it.
     fn default() -> Self {
-        Self::new()
+        Self::with_capacity(0)
     }
 }
 
 impl<T> AppendOnlyVec<T> {
-    /// Constructs an empty vector with no allocations.
-    pub fn new() -> Self {
-        let buckets: [AtomicPtr<Slot<T>>; N_BUCKETS] =
-            std::array::from_fn(|_| AtomicPtr::new(ptr::null_mut()));
-        Self {
-            buckets,
-            reserved: AtomicUsize::new(0),
-        }
-    }
-
-    /// Constructs an empty vector and pre-allocates buckets sufficient to
-    /// hold at least `cap` entries without further allocation.
+    /// Construct an empty vector with capacity for `cap` elements.
+    /// The buffer is allocated once and never reallocated; `push`
+    /// fails (returns `None`) once `cap` slots are filled.
     pub fn with_capacity(cap: usize) -> Self {
-        let v = Self::new();
-        let mut remaining = cap;
-        let mut bucket_idx = 0;
-        while remaining > 0 && bucket_idx < N_BUCKETS {
-            // SAFETY: bucket_idx in range; no concurrent access during construction.
-            let _ = unsafe { v.alloc_bucket(bucket_idx) };
-            let size = Self::bucket_size(bucket_idx);
-            remaining = remaining.saturating_sub(size);
-            bucket_idx += 1;
+        let mut v: Vec<UnsafeCell<MaybeUninit<T>>> = Vec::with_capacity(cap);
+        // Fill the buffer with uninitialised slot cells. Slots above
+        // `published` are never read as `T`; only those below the
+        // published prefix are.
+        for _ in 0..cap {
+            v.push(UnsafeCell::new(MaybeUninit::uninit()));
         }
-        v
+        Self {
+            slots: v.into_boxed_slice(),
+            reserved: AtomicUsize::new(0),
+            published: AtomicUsize::new(0),
+        }
     }
 
-    /// Number of slots currently reserved. Some may not yet be published
-    /// to readers (writers may still be in flight); `iter` and `get`
-    /// respect each slot's `init` flag separately.
+    /// Total slot capacity set at construction.
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Number of fully published entries visible to readers.
     #[inline]
     pub fn count(&self) -> usize {
-        self.reserved.load(Ordering::Acquire)
+        self.published.load(Ordering::Acquire)
     }
 
-    /// Returns `&T` at logical index `idx`, or `None` if the slot is out
-    /// of range or has not yet been published by its writer. Lock-free.
-    pub fn get(&self, idx: usize) -> Option<&T> {
-        if idx >= self.reserved.load(Ordering::Acquire) {
-            return None;
-        }
-        let (bucket_idx, slot) = Self::locate(idx);
-        let bucket_ptr = self.buckets[bucket_idx].load(Ordering::Acquire);
-        if bucket_ptr.is_null() {
-            return None;
-        }
-        // SAFETY: bucket_ptr is non-null and was Release-stored by the
-        // writer that allocated this bucket. The slot pointer arithmetic
-        // is within the allocated bucket.
-        unsafe {
-            let slot_ptr = bucket_ptr.add(slot);
-            if !(*slot_ptr).init.load(Ordering::Acquire) {
-                return None;
-            }
-            // SAFETY: init==true implies the writer has called write() on
-            // the cell and stored init with Release. The Acquire load
-            // synchronises with that, so the value is fully published.
-            Some((*(*slot_ptr).value.get()).assume_init_ref())
-        }
+    /// True if the vector is empty.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.count() == 0
     }
 
-    /// Append `value` and return its index. Multi-writer concurrent.
-    /// Unbounded: assumes `usize::MAX` is unreachable. For width-bounded
-    /// pushes (categorical u8/u16 etc.), use [`push_bounded`].
-    pub fn push(&self, value: T) -> usize {
-        let idx = self.reserved.fetch_add(1, Ordering::Relaxed);
-        // SAFETY: idx is exclusively ours by the atomic claim.
-        unsafe { self.write_at(idx, value) };
-        idx
-    }
-
-    /// Append `value` only if the total reserved count would remain
-    /// strictly below `max_cap`. Returns `None` if the cap is exhausted -
-    /// no slot is reserved, no value is dropped, no state leaks.
+    /// Append `value`. Returns the assigned index, or `None` if the
+    /// pre-allocated capacity is exhausted.
     ///
-    /// Uses a `compare_exchange_weak` loop on `reserved` so capacity is
-    /// enforced exactly under any concurrent contention.
-    pub fn push_bounded(&self, value: T, max_cap: usize) -> Option<usize> {
-        let mut current = self.reserved.load(Ordering::Relaxed);
-        let idx = loop {
-            if current >= max_cap {
-                return None;
-            }
-            match self.reserved.compare_exchange_weak(
-                current,
-                current + 1,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break current,
-                Err(actual) => current = actual,
+    /// Concurrent-safe and lock-free. Multiple writers can call this
+    /// from different threads simultaneously - each claims a distinct
+    /// slot via a cap-bounded `compare_exchange_weak`. Writers commit
+    /// their slot in claim order via the `published` counter: after
+    /// writing the value, a writer spins briefly on `published` until
+    /// its predecessor has committed, then `Release`-stores its own
+    /// commit. The spin loop uses `std::hint::spin_loop` so the
+    /// hardware backs off on contention.
+    pub fn push(&self, value: T) -> Option<usize> {
+        // Step 1: claim a slot via cap-bounded CAS. A failed CAS
+        // never advances `reserved`, so a cap overshoot can't leak.
+        let idx = {
+            let mut cur = self.reserved.load(Ordering::Relaxed);
+            loop {
+                if cur >= self.slots.len() {
+                    return None;
+                }
+                match self.reserved.compare_exchange_weak(
+                    cur,
+                    cur + 1,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break cur,
+                    Err(actual) => cur = actual,
+                }
             }
         };
-        // SAFETY: idx is exclusively ours by the successful CAS.
-        unsafe { self.write_at(idx, value) };
+
+        // Step 2: write the value into our exclusively-claimed slot.
+        // SAFETY: idx < cap by the CAS bound; no other thread can
+        // claim this idx because `reserved` has already moved past it.
+        unsafe {
+            (*self.slots[idx].get()).write(value);
+        }
+
+        // Step 3: wait for predecessors to commit, then commit our
+        // slot. Predecessors hold lower idx values; each commits by
+        // bumping `published` from N to N+1 in claim order. Once
+        // `published` reaches `idx`, our slot is the next to commit.
+        // Spin-wait via `spin_loop` hints the hardware to back off
+        // (e.g., issue PAUSE on x86) without parking the thread.
+        while self.published.load(Ordering::Acquire) != idx {
+            std::hint::spin_loop();
+        }
+        // `Release` store synchronises with the `Acquire` load in
+        // readers (`count`, `as_slice`, `get`) so the value written
+        // above is visible to any reader that observes `idx + 1`.
+        self.published.store(idx + 1, Ordering::Release);
+
         Some(idx)
     }
 
-    /// Lock-free iterator yielding `(index, &T)` pairs over the
-    /// fully-published prefix of the vector. Stops at the first slot
-    /// that is reserved but not yet published; that slot and any later
-    /// ones are invisible to this iterator (subsequent `iter()` calls
-    /// may see them).
+    /// Returns the published prefix as a contiguous slice. Lock-free.
+    /// The slice covers all slots committed at the moment of the call;
+    /// commits happening concurrently with this call may publish new
+    /// slots, but those will only appear in subsequent `as_slice`
+    /// invocations.
+    pub fn as_slice(&self) -> &[T] {
+        let len = self.published.load(Ordering::Acquire);
+        // SAFETY: slots [0, len) are fully initialised and published
+        // - their writers `Release`-stored the published counter to
+        // values >= len + 1 after writing the value. The `Acquire`
+        // load above synchronises with those stores.
+        // `UnsafeCell<MaybeUninit<T>>` has the same layout as `T`, so
+        // casting the base pointer is sound.
+        unsafe { std::slice::from_raw_parts(self.slots.as_ptr() as *const T, len) }
+    }
+
+    /// Returns `&T` at logical index `idx`, or `None` if the slot has
+    /// not yet been published. Lock-free.
+    #[inline]
+    pub fn get(&self, idx: usize) -> Option<&T> {
+        let len = self.published.load(Ordering::Acquire);
+        if idx >= len {
+            return None;
+        }
+        // SAFETY: idx < published => slot is fully committed.
+        Some(unsafe { (*self.slots[idx].get()).assume_init_ref() })
+    }
+
+    /// Returns an iterator over `(index, &T)` pairs covering the
+    /// published prefix at the moment of the call.
+    #[inline]
     pub fn iter(&self) -> Iter<'_, T> {
         Iter {
-            vec: self,
+            slice: self.as_slice(),
             idx: 0,
-            upper: self.reserved.load(Ordering::Acquire),
-        }
-    }
-
-    // ----- internal -----
-
-    /// Bucket size schedule: bucket `i` holds `FIRST_BUCKET << i` entries.
-    #[inline]
-    fn bucket_size(i: usize) -> usize {
-        FIRST_BUCKET << i
-    }
-
-    /// Logical index → `(bucket, slot_within_bucket)`.
-    #[inline]
-    fn locate(logical: usize) -> (usize, usize) {
-        // Sum of bucket sizes 0..i is FIRST_BUCKET * (2^i - 1).
-        // For logical `n`, find i such that
-        //   FIRST_BUCKET * (2^i - 1) <= n < FIRST_BUCKET * (2^(i+1) - 1)
-        // i.e. (n / FIRST_BUCKET) + 1 falls in [2^i, 2^(i+1)).
-        let shifted = (logical / FIRST_BUCKET) + 1;
-        let bucket = (usize::BITS - 1 - shifted.leading_zeros()) as usize;
-        let bucket_start = FIRST_BUCKET * ((1usize << bucket) - 1);
-        let slot = logical - bucket_start;
-        (bucket, slot)
-    }
-
-    /// Allocate bucket `bucket_idx` if not already allocated and return
-    /// the (potentially racing) winner's pointer.
-    fn ensure_bucket(&self, bucket_idx: usize) -> *mut Slot<T> {
-        let existing = self.buckets[bucket_idx].load(Ordering::Acquire);
-        if !existing.is_null() {
-            return existing;
-        }
-        // SAFETY: bucket_idx in range; CAS resolves the multi-writer race.
-        unsafe { self.alloc_bucket(bucket_idx) }
-    }
-
-    /// Allocate bucket `bucket_idx`. Multi-writer safe: if another writer
-    /// races and installs first, we free our allocation and return their
-    /// pointer.
-    unsafe fn alloc_bucket(&self, bucket_idx: usize) -> *mut Slot<T> {
-        let size = Self::bucket_size(bucket_idx);
-        let layout = Layout::array::<Slot<T>>(size)
-            .expect("bucket layout fits in usize");
-        // SAFETY: layout.size() > 0 because size >= 1.
-        let raw = unsafe { alloc(layout) } as *mut Slot<T>;
-        if raw.is_null() {
-            std::alloc::handle_alloc_error(layout);
-        }
-        // Initialise each slot's `init` flag and `value` cell. We must
-        // not skip the init=false write: ptr::write past uninitialised
-        // memory for AtomicBool is required so that subsequent atomic
-        // operations see a defined value.
-        for i in 0..size {
-            // SAFETY: raw.add(i) is in-bounds within the freshly allocated
-            // bucket.
-            unsafe {
-                ptr::write(
-                    raw.add(i),
-                    Slot {
-                        init: AtomicBool::new(false),
-                        value: UnsafeCell::new(MaybeUninit::uninit()),
-                    },
-                );
-            }
-        }
-        // Install via CAS. If we lose the race, free our buffer and use
-        // the winner's.
-        match self.buckets[bucket_idx].compare_exchange(
-            ptr::null_mut(),
-            raw,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => raw,
-            Err(existing) => {
-                // SAFETY: `raw` was allocated by us with `layout`; drop
-                // each Slot (only the AtomicBool needs dropping; value
-                // is MaybeUninit) and free the allocation.
-                for i in 0..size {
-                    unsafe { ptr::drop_in_place(raw.add(i)) };
-                }
-                unsafe { dealloc(raw as *mut u8, layout) };
-                existing
-            }
-        }
-    }
-
-    /// Write `value` into the slot at logical index `idx` and publish
-    /// `init=true`. Caller must hold an exclusive claim on the slot via
-    /// `reserved.fetch_add` or a successful `compare_exchange_weak`.
-    ///
-    /// # Safety
-    /// `idx` must be a slot the caller exclusively claimed and has not
-    /// yet written to.
-    unsafe fn write_at(&self, idx: usize, value: T) {
-        let (bucket_idx, slot) = Self::locate(idx);
-        let bucket_ptr = self.ensure_bucket(bucket_idx);
-        // SAFETY: slot_ptr is in-bounds within the bucket; the slot is
-        // exclusively ours by the caller's claim.
-        unsafe {
-            let slot_ptr = bucket_ptr.add(slot);
-            (*(*slot_ptr).value.get()).write(value);
-            (*slot_ptr).init.store(true, Ordering::Release);
         }
     }
 }
@@ -293,8 +209,7 @@ impl<T> std::ops::Index<usize> for AppendOnlyVec<T> {
     type Output = T;
 
     /// Panicking indexed access. Use [`get`](Self::get) for a fallible
-    /// version. Panics if `idx` is out of range or if the slot is
-    /// reserved but not yet published by its writer.
+    /// version. Panics if `idx` is out of range or not yet published.
     fn index(&self, idx: usize) -> &T {
         self.get(idx).unwrap_or_else(|| {
             panic!(
@@ -304,236 +219,199 @@ impl<T> std::ops::Index<usize> for AppendOnlyVec<T> {
     }
 }
 
-impl<T> Drop for AppendOnlyVec<T> {
-    fn drop(&mut self) {
-        let total = *self.reserved.get_mut();
-        let mut remaining = total;
-        for bucket_idx in 0..N_BUCKETS {
-            let bucket_ptr = *self.buckets[bucket_idx].get_mut();
-            if bucket_ptr.is_null() {
-                break;
-            }
-            let size = Self::bucket_size(bucket_idx);
-            // Drop initialised slots. A reserved-but-not-yet-published
-            // slot has init=false, so we leave its value cell as
-            // MaybeUninit and only drop the Slot's AtomicBool (via the
-            // ptr::drop_in_place below).
-            for slot in 0..size {
-                // SAFETY: slot_ptr is in-bounds within the bucket.
-                unsafe {
-                    let slot_ptr = bucket_ptr.add(slot);
-                    if *(*slot_ptr).init.get_mut() {
-                        (*(*slot_ptr).value.get()).assume_init_drop();
-                    }
-                    ptr::drop_in_place(slot_ptr);
-                }
-            }
-            remaining = remaining.saturating_sub(size);
-            let layout = Layout::array::<Slot<T>>(size)
-                .expect("bucket layout fits in usize");
-            // SAFETY: bucket_ptr was allocated with this layout.
-            unsafe { dealloc(bucket_ptr as *mut u8, layout) };
-        }
-        let _ = remaining;
+impl<T> std::ops::Deref for AppendOnlyVec<T> {
+    type Target = [T];
+
+    /// Deref to the published prefix. Lets the vector be used wherever
+    /// a `&[T]` is expected; same lock-free semantics as `as_slice`.
+    fn deref(&self) -> &[T] {
+        self.as_slice()
     }
 }
 
-/// Iterator yielded by [`AppendOnlyVec::iter`].
+impl<T> Drop for AppendOnlyVec<T> {
+    fn drop(&mut self) {
+        // `published.get_mut()` is sound: we have unique access.
+        let len = *self.published.get_mut();
+        for i in 0..len {
+            // SAFETY: i < published => slot is initialised.
+            unsafe {
+                (*self.slots[i].get()).assume_init_drop();
+            }
+        }
+        // `Box<[UnsafeCell<MaybeUninit<T>>]>` drops the cells; their
+        // contents are `MaybeUninit` (no Drop), so nothing more to do.
+    }
+}
+
+/// Iterator returned by [`AppendOnlyVec::iter`].
 pub struct Iter<'a, T> {
-    vec: &'a AppendOnlyVec<T>,
+    slice: &'a [T],
     idx: usize,
-    /// Upper bound captured at iterator construction; the iterator never
-    /// looks past this index.
-    upper: usize,
 }
 
 impl<'a, T> Iterator for Iter<'a, T> {
     type Item = (usize, &'a T);
 
-    fn next(&mut self) -> Option<Self::Item> {
-        while self.idx < self.upper {
-            let i = self.idx;
-            self.idx += 1;
-            // get() returns None for not-yet-published slots; stop on the
-            // first such slot so iteration yields a consistent prefix.
-            match self.vec.get(i) {
-                Some(v) => return Some((i, v)),
-                None => return None,
-            }
+    fn next(&mut self) -> Option<(usize, &'a T)> {
+        if self.idx >= self.slice.len() {
+            return None;
         }
-        None
+        let i = self.idx;
+        let v = &self.slice[i];
+        self.idx += 1;
+        Some((i, v))
     }
 }
+
+// -------- tests --------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::thread;
 
     #[test]
-    fn empty_starts_empty() {
-        let v: AppendOnlyVec<String> = AppendOnlyVec::new();
-        assert_eq!(v.count(), 0);
-        assert!(v.get(0).is_none());
-        assert_eq!(v.iter().count(), 0);
+    fn push_under_cap_succeeds() {
+        let v = AppendOnlyVec::<u32>::with_capacity(4);
+        assert_eq!(v.push(10), Some(0));
+        assert_eq!(v.push(20), Some(1));
+        assert_eq!(v.count(), 2);
+        assert_eq!(v.as_slice(), &[10, 20]);
     }
 
     #[test]
-    fn push_and_get_returns_stable_addresses() {
-        let v: AppendOnlyVec<String> = AppendOnlyVec::new();
-        let mut refs: Vec<*const String> = Vec::new();
-        for i in 0..200 {
-            let idx = v.push(format!("v{i}"));
-            assert_eq!(idx, i);
-            refs.push(v.get(i).unwrap() as *const String);
-        }
-        // After all the pushes (crossing multiple bucket boundaries),
-        // earlier references must still resolve to the original strings.
-        for (i, r) in refs.iter().enumerate() {
-            // SAFETY: AppendOnlyVec guarantees stable addresses for the
-            // vector's lifetime.
-            let s: &String = unsafe { &**r };
-            assert_eq!(s, &format!("v{i}"));
-        }
+    fn push_past_cap_returns_none_and_leaves_state_unchanged() {
+        let v = AppendOnlyVec::<u32>::with_capacity(2);
+        assert_eq!(v.push(1), Some(0));
+        assert_eq!(v.push(2), Some(1));
+        // Cap reached; subsequent pushes return None without reserving
+        // a slot. Count is unchanged.
+        assert_eq!(v.push(3), None);
+        assert_eq!(v.count(), 2);
+        assert_eq!(v.as_slice(), &[1, 2]);
     }
 
     #[test]
-    fn iter_yields_in_order() {
-        let v: AppendOnlyVec<String> = AppendOnlyVec::new();
-        for i in 0..50 {
-            v.push(format!("e{i}"));
-        }
-        let items: Vec<(usize, String)> =
-            v.iter().map(|(i, s)| (i, s.clone())).collect();
-        assert_eq!(items.len(), 50);
-        for (i, (actual_idx, actual_str)) in items.iter().enumerate() {
-            assert_eq!(*actual_idx, i);
-            assert_eq!(actual_str, &format!("e{i}"));
-        }
+    fn index_get_slice_agree() {
+        let v = AppendOnlyVec::<String>::with_capacity(8);
+        v.push("a".into());
+        v.push("b".into());
+        v.push("c".into());
+        assert_eq!(&v[0], "a");
+        assert_eq!(&v[1], "b");
+        assert_eq!(v.get(2).map(String::as_str), Some("c"));
+        assert!(v.get(3).is_none());
+        let slice: &[String] = v.as_slice();
+        assert_eq!(slice, &["a".to_string(), "b".into(), "c".into()]);
     }
 
     #[test]
-    fn locate_round_trips_across_buckets() {
-        assert_eq!(AppendOnlyVec::<String>::locate(0), (0, 0));
-        assert_eq!(AppendOnlyVec::<String>::locate(15), (0, 15));
-        assert_eq!(AppendOnlyVec::<String>::locate(16), (1, 0));
-        assert_eq!(AppendOnlyVec::<String>::locate(47), (1, 31));
-        assert_eq!(AppendOnlyVec::<String>::locate(48), (2, 0));
-        assert_eq!(AppendOnlyVec::<String>::locate(111), (2, 63));
+    fn deref_to_slice() {
+        let v = AppendOnlyVec::<u32>::with_capacity(4);
+        v.push(7);
+        v.push(8);
+        let s: &[u32] = &*v;
+        assert_eq!(s, &[7, 8]);
     }
 
     #[test]
-    fn push_bounded_respects_cap_exactly() {
-        let v: AppendOnlyVec<u32> = AppendOnlyVec::new();
-        for i in 0..10 {
-            assert_eq!(v.push_bounded(i, 10), Some(i as usize));
+    fn iter_yields_index_and_ref() {
+        let v = AppendOnlyVec::<u32>::with_capacity(4);
+        v.push(100);
+        v.push(200);
+        let pairs: Vec<(usize, u32)> = v.iter().map(|(i, x)| (i, *x)).collect();
+        assert_eq!(pairs, vec![(0, 100), (1, 200)]);
+    }
+
+    #[test]
+    fn drop_releases_initialised_prefix() {
+        // Arc<()> as a drop tracer: each clone bumps strong_count, drop
+        // releases it. Push three clones, drop the vec, assert the count
+        // returns to the original 1.
+        let canary = Arc::new(());
+        {
+            let v = AppendOnlyVec::<Arc<()>>::with_capacity(8);
+            v.push(canary.clone());
+            v.push(canary.clone());
+            v.push(canary.clone());
+            assert_eq!(Arc::strong_count(&canary), 4);
         }
-        // Cap hit; further pushes return None and don't reserve a slot.
-        assert_eq!(v.push_bounded(99, 10), None);
-        assert_eq!(v.count(), 10);
-        assert_eq!(v.push_bounded(99, 10), None);
-        assert_eq!(v.count(), 10);
+        assert_eq!(Arc::strong_count(&canary), 1);
     }
 
+    /// Stress test: 16 threads each pushing 32 values against a cap of
+    /// 256. Exactly 256 pushes succeed, 256 hit the cap. Count is
+    /// exact; the published slice contains all 256 distinct accepted
+    /// values with no leaks or torn writes.
     #[test]
-    fn concurrent_multi_writer_respects_cap() {
-        use std::sync::Arc;
-        use std::thread;
-
-        // Stress the u8-style 256-cap race: many threads each trying to
-        // push, with 256 total slots available.
-        let v: Arc<AppendOnlyVec<usize>> = Arc::new(AppendOnlyVec::new());
+    fn concurrent_push_honours_cap_exactly() {
+        let v: Arc<AppendOnlyVec<u32>> = Arc::new(AppendOnlyVec::with_capacity(256));
         let mut handles = Vec::new();
-        for t in 0..16 {
+        for t in 0..16u32 {
             let v = Arc::clone(&v);
             handles.push(thread::spawn(move || {
-                let mut local = Vec::new();
-                for i in 0..100 {
-                    if let Some(idx) = v.push_bounded(t * 1000 + i, 256) {
-                        local.push(idx);
+                let mut accepted = 0usize;
+                for i in 0..32 {
+                    if v.push(t * 32 + i).is_some() {
+                        accepted += 1;
                     }
                 }
-                local
+                accepted
             }));
         }
-        let mut all: Vec<usize> = Vec::new();
-        for h in handles {
-            all.extend(h.join().unwrap());
-        }
-        // Exactly 256 successful pushes across all threads.
-        assert_eq!(all.len(), 256);
-        // Every claimed index is unique and in 0..256.
-        all.sort();
-        for (i, idx) in all.iter().enumerate() {
-            assert_eq!(*idx, i);
-        }
+        let total_accepted: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
+        assert_eq!(total_accepted, 256);
         assert_eq!(v.count(), 256);
+        let slice = v.as_slice();
+        assert_eq!(slice.len(), 256);
+        // All 512 distinct candidate values were either accepted or
+        // rejected at the cap; no value is duplicated or lost.
+        let mut seen = std::collections::HashSet::new();
+        for &x in slice {
+            assert!(seen.insert(x), "duplicate value in slice: {x}");
+        }
     }
 
+    /// Concurrent push interleaved with concurrent reads. Readers
+    /// observe a strictly-growing prefix; every readable slot is
+    /// fully published (no torn writes).
     #[test]
-    fn concurrent_readers_with_multi_writer() {
-        use std::sync::Arc;
-        use std::thread;
-
-        let v: Arc<AppendOnlyVec<String>> = Arc::new(AppendOnlyVec::new());
-        let n_per_writer = 2_000;
-        let n_writers = 4;
-
-        let mut writer_handles = Vec::new();
-        for t in 0..n_writers {
-            let v = Arc::clone(&v);
-            writer_handles.push(thread::spawn(move || {
-                for i in 0..n_per_writer {
-                    v.push(format!("w{t}_{i}"));
-                }
-            }));
-        }
-
-        let mut reader_handles = Vec::new();
-        for _ in 0..3 {
-            let v = Arc::clone(&v);
-            reader_handles.push(thread::spawn(move || {
-                let target = n_writers * n_per_writer;
-                let mut seen_max = 0;
-                while seen_max < target {
-                    let n = v.count();
-                    for i in 0..n {
-                        // get() returns None for slots in flight; that's
-                        // fine, we'll see them on the next pass.
-                        if let Some(s) = v.get(i) {
-                            assert!(s.starts_with('w'));
-                        }
+    fn concurrent_push_and_read() {
+        let v: Arc<AppendOnlyVec<u64>> = Arc::new(AppendOnlyVec::with_capacity(10_000));
+        let writers: Vec<_> = (0..8u64)
+            .map(|t| {
+                let v = Arc::clone(&v);
+                thread::spawn(move || {
+                    for i in 0..1_000 {
+                        let _ = v.push(t * 1_000 + i);
                     }
-                    seen_max = n;
-                }
-            }));
+                })
+            })
+            .collect();
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let v = Arc::clone(&v);
+                thread::spawn(move || {
+                    let mut last_len = 0;
+                    for _ in 0..1_000 {
+                        let s = v.as_slice();
+                        assert!(s.len() >= last_len, "published prefix shrank");
+                        last_len = s.len();
+                        // Touch every element so a torn write would show
+                        // up as a SEGV or assertion in MIRI.
+                        let _sum: u64 = s.iter().sum();
+                    }
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().unwrap();
         }
-
-        for h in writer_handles {
-            h.join().unwrap();
+        for r in readers {
+            r.join().unwrap();
         }
-        for h in reader_handles {
-            h.join().unwrap();
-        }
-        assert_eq!(v.count(), n_writers * n_per_writer);
-    }
-
-    #[test]
-    fn drop_runs_for_initialised_slots_only() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        struct Counted(usize, &'static AtomicUsize);
-        impl Drop for Counted {
-            fn drop(&mut self) {
-                self.1.fetch_add(1, Ordering::SeqCst);
-            }
-        }
-
-        static DROPS: AtomicUsize = AtomicUsize::new(0);
-        {
-            let v: AppendOnlyVec<Counted> = AppendOnlyVec::new();
-            for i in 0..200 {
-                v.push(Counted(i, &DROPS));
-            }
-        }
-        assert_eq!(DROPS.load(Ordering::SeqCst), 200);
+        assert_eq!(v.count(), 8_000);
     }
 }

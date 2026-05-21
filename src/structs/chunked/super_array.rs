@@ -1790,11 +1790,12 @@ mod tests {
         }
     }
 
-    /// Pushing categorical chunks into a SuperArray installs a manager on
-    /// the first push and absorbs subsequent chunks against it. Both
-    /// chunks become `Shared`; the earlier chunk's snapshot is a prefix
-    /// of the later one (append-only invariant), and the manager carries
-    /// the union of all entries.
+    /// Pushing categorical chunks into a SuperArray installs the shared
+    /// dictionary on the first push and absorbs subsequent chunks
+    /// against it. Every chunk holds a clone of the same `Dictionary`
+    /// handle (Arc-shared), so a `shares_with` check is true across
+    /// them, and growth observed at any one chunk is immediately
+    /// visible at all others (single atomic store).
     #[cfg(all(
         feature = "shared_dict",
         any(not(feature = "default_categorical_8"), feature = "extended_categorical")
@@ -1803,7 +1804,6 @@ mod tests {
     fn test_shared_dict_absorb_across_pushes() {
         use crate::TextArray;
         use crate::arr_cat32;
-        use crate::structs::dictionary::Dictionary;
 
         let chunk1: Array = arr_cat32!("a", "b", "a");
         let chunk2: Array = arr_cat32!("b", "c", "a");
@@ -1812,50 +1812,38 @@ mod tests {
         sa.push(chunk1);
         sa.push(chunk2);
 
-        // Snapshot reads inside dedicated scopes so the immutable borrows
-        // do not collide with the third `push` below.
-        let (d1_snapshot, d1_values): (Dictionary<u32>, Vec<String>);
-        {
-            let d0 = match &sa.chunks[0] {
-                Array::TextArray(TextArray::Categorical32(a)) => &a.dictionary,
-                _ => panic!("expected Categorical32"),
-            };
-            let d1 = match &sa.chunks[1] {
-                Array::TextArray(TextArray::Categorical32(a)) => &a.dictionary,
-                _ => panic!("expected Categorical32"),
-            };
-            // Both chunks bind to a Shared snapshot. The first chunk's
-            // snapshot ({a, b}) is a prefix of the second's ({a, b, c}) by
-            // the append-only invariant, so codes assigned against chunk 0
-            // still decode correctly against chunk 1's dictionary.
-            assert!(matches!(d0, Dictionary::Shared(_)));
-            assert!(matches!(d1, Dictionary::Shared(_)));
-            assert_eq!(d0.values(), &["a", "b"]);
-            assert_eq!(d1.values(), &["a", "b", "c"]);
-            assert!(d0.is_prefix_of(d1));
-            d1_snapshot = d1.clone();
-            d1_values = d1.values().to_vec();
-        }
+        let d0 = match &sa.chunks[0] {
+            Array::TextArray(TextArray::Categorical32(a)) => a.dictionary.clone(),
+            _ => panic!("expected Categorical32"),
+        };
+        let d1 = match &sa.chunks[1] {
+            Array::TextArray(TextArray::Categorical32(a)) => a.dictionary.clone(),
+            _ => panic!("expected Categorical32"),
+        };
+        // Both chunks hold a clone of the same `Dictionary` handle - the
+        // single atomic store backing the sharing group.
+        assert!(d0.shares_with(&d1));
+        // Every chunk observes the union of all interned strings,
+        // including those added after its own push.
+        assert_eq!(d0.values(), &["a", "b", "c"]);
+        assert_eq!(d1.values(), &["a", "b", "c"]);
 
-        // When the next push introduces no new entries the manager's Arc
-        // is not rotated, so the new chunk's snapshot is pointer-equal
-        // to the previous one.
         let chunk3: Array = arr_cat32!("a", "b");
         sa.push(chunk3);
         let d2 = match &sa.chunks[2] {
-            Array::TextArray(TextArray::Categorical32(a)) => &a.dictionary,
+            Array::TextArray(TextArray::Categorical32(a)) => a.dictionary.clone(),
             _ => panic!("expected Categorical32"),
         };
-        assert_eq!(d2.values(), d1_values.as_slice());
-        assert!(d1_snapshot.shares_with(d2));
+        assert!(d0.shares_with(&d2));
+        assert_eq!(d2.values(), &["a", "b", "c"]);
 
-        // category_dispatch returns Some and interning a known value is idempotent.
+        // category_dispatch returns Some; interning known values is idempotent.
         let dispatch = sa.category_dispatch().expect("dispatch present after push");
         match dispatch {
-            CategoryDispatch::U32(m) => {
-                assert_eq!(m.intern("a"), Ok(0));
-                assert_eq!(m.intern("b"), Ok(1));
-                assert_eq!(m.intern("c"), Ok(2));
+            CategoryDispatch::U32(d) => {
+                assert_eq!(d.intern("a"), Ok(0));
+                assert_eq!(d.intern("b"), Ok(1));
+                assert_eq!(d.intern("c"), Ok(2));
             }
             _ => panic!("expected U32 dispatch"),
         }

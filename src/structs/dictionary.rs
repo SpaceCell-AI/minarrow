@@ -135,8 +135,13 @@ pub struct DictionaryInner<T: Integer> {
 
 impl<T: Integer> Default for DictionaryInner<T> {
     fn default() -> Self {
+        // Pre-allocate the value array to the type's natural cap.
+        // The cap is fixed for the dictionary's lifetime (the
+        // `AppendOnlyVec` never reallocates); `push` returns `None`
+        // when the cap is reached, which `intern` surfaces as
+        // `DictionaryError::Overflow`.
         Self {
-            values: AppendOnlyVec::new(),
+            values: AppendOnlyVec::with_capacity(max_cap::<T>()),
             index: ShardedIndex::default(),
         }
     }
@@ -173,7 +178,7 @@ impl<T: Integer> Dictionary<T> {
     pub fn from_values(values: impl Into<Vec64<String>>) -> Self {
         let values: Vec64<String> = values.into();
         let d = Self::default();
-        let cap = max_cap::<T>();
+        let cap = d.inner.values.capacity();
         for (i, s) in values.into_iter().enumerate() {
             assert!(
                 i < cap,
@@ -185,25 +190,27 @@ impl<T: Integer> Dictionary<T> {
             // value (de-duped in the construction loop below).
             let shard = &d.inner.index.shards[ShardedIndex::<T>::shard_for(&s)];
             let mut g = shard.lock().expect("dictionary shard poisoned");
-            if let Some(&existing) = g.get(&s) {
-                let _ = existing;
+            if g.get(&s).is_some() {
                 continue;
             }
             let idx = d
                 .inner
                 .values
-                .push_bounded(s.clone(), cap)
+                .push(s.clone())
                 .expect("checked cap above");
             g.insert(s, T::from_usize(idx));
         }
         d
     }
 
-    /// Borrow the lock-free value array. Indexing returns `&String`, which
-    /// derefs to `&str` for the lifetime of `&self`.
+    /// Borrow the published prefix of the value array as a slice.
+    /// Lock-free; indexing returns `&String`, which derefs to `&str`
+    /// for the lifetime of `&self`. Concurrent pushes may publish
+    /// additional slots after this call returns; those are visible to
+    /// subsequent invocations.
     #[inline]
-    pub fn values(&self) -> &AppendOnlyVec<String> {
-        &self.inner.values
+    pub fn values(&self) -> &[String] {
+        self.inner.values.as_slice()
     }
 
     /// Number of entries currently visible to readers.
@@ -235,11 +242,10 @@ impl<T: Integer> Dictionary<T> {
         if let Some(&code) = g.get(value) {
             return Ok(code);
         }
-        let cap = max_cap::<T>();
         let idx = self
             .inner
             .values
-            .push_bounded(value.to_owned(), cap)
+            .push(value.to_owned())
             .ok_or(DictionaryError::Overflow)?;
         let code = T::from_usize(idx);
         g.insert(value.to_owned(), code);
@@ -302,14 +308,13 @@ impl<T: Integer> Dictionary<T> {
     /// current entries but stop receiving updates from the group.
     pub fn detach_to_owned(&mut self) {
         let fresh = Dictionary::<T>::default();
-        let cap = max_cap::<T>();
         for (_, s) in self.inner.values.iter() {
             let shard = &fresh.inner.index.shards[ShardedIndex::<T>::shard_for(s)];
             let mut g = shard.lock().expect("dictionary shard poisoned");
             let idx = fresh
                 .inner
                 .values
-                .push_bounded(s.clone(), cap)
+                .push(s.clone())
                 .expect("source dict already within cap");
             g.insert(s.clone(), T::from_usize(idx));
         }
@@ -364,18 +369,25 @@ impl<T: Integer, S: Into<String>> FromIterator<S> for Dictionary<T> {
     }
 }
 
-/// Inclusive cap on the number of entries for index type `T`, expressed
-/// as a `usize`. `u8 -> 256`, `u16 -> 65536`, `u32/u64 -> saturated`.
+/// Practical entry cap used by `Dictionary::default()`. Narrow widths
+/// receive their natural cap; `u32`/`u64` receive a soft cap of
+/// `1 << 20` (1 048 576) entries because preallocating their natural
+/// cap would reserve ~100 GB+ of virtual address space per dictionary
+/// (allocators reject the request even with overcommit). Users who
+/// genuinely need a larger cap can pass it via `with_capacity`.
+///
+/// `u8 -> 256`, `u16 -> 65 536`, `u32/u64 -> 1 048 576`.
+const DEFAULT_WIDE_CAP: usize = 1 << 20;
+
 #[inline]
 fn max_cap<T: Integer>() -> usize {
-    // T::from_usize(usize::MAX) saturates for narrow widths; reverse
-    // engineer the cap by querying the trait directly.
-    //
-    // Strategy: try `from_usize(usize::MAX)`; the returned T's
-    // `to_usize()` gives the maximum representable value. Add 1 to get
-    // the cap (exclusive upper bound on indices).
-    let max_t: T = T::from_usize(usize::MAX);
-    max_t.to_usize().saturating_add(1)
+    use num_traits::Bounded;
+    let type_max = T::max_value().to_usize().saturating_add(1);
+    if type_max > DEFAULT_WIDE_CAP {
+        DEFAULT_WIDE_CAP
+    } else {
+        type_max
+    }
 }
 
 // =============================================================================
@@ -494,7 +506,7 @@ mod tests {
         assert_eq!(d.intern("c"), Ok(2));
         assert_eq!(d.intern("a"), Ok(0));
         assert_eq!(d.len(), 3);
-        let values: Vec<&str> = d.values().iter().map(|(_, s)| s.as_str()).collect();
+        let values: Vec<&str> = d.values().iter().map(|s| s.as_str()).collect();
         assert_eq!(values, vec!["a", "b", "c"]);
     }
 
@@ -505,7 +517,7 @@ mod tests {
         assert!(d.shares_with(&cloned));
         // Update through one is visible through the other.
         assert_eq!(d.intern("a"), Ok(0));
-        let values: Vec<&str> = cloned.values().iter().map(|(_, s)| s.as_str()).collect();
+        let values: Vec<&str> = cloned.values().iter().map(|s| s.as_str()).collect();
         assert_eq!(values, vec!["a"]);
     }
 

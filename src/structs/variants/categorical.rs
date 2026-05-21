@@ -44,6 +44,7 @@ use rayon::iter::ParallelIterator;
 use crate::aliases::CategoricalAVT;
 use crate::enums::error::MinarrowError;
 use crate::enums::shape_dim::ShapeDim;
+#[cfg(feature = "shared_dict")]
 use crate::structs::dictionary::Dictionary;
 use crate::traits::concatenate::Concatenate;
 use crate::traits::shape::Shape;
@@ -54,6 +55,29 @@ use crate::{
     impl_array_ref_deref,
 };
 use ::vec64::{Vec64, Vec64Alloc};
+
+/// Without `shared_dict`, returns the existing code for `value` if it
+/// is already in `unique_values`, else pushes it and returns the new
+/// code. Linear scan, matching pre-PR `push_str` semantics. Panics if
+/// the new cardinality would exceed the capacity of `T`.
+#[cfg(not(feature = "shared_dict"))]
+#[inline]
+fn intern_into<T: Integer>(unique_values: &mut Vec64<String>, value: &str) -> T {
+    if let Some(pos) = unique_values.iter().position(|s| s.as_str() == value) {
+        return T::from_usize(pos);
+    }
+    let i = unique_values.len();
+    let c = T::try_from(i).ok().unwrap_or_else(|| {
+        panic!(
+            "Dictionary category interning failed: cardinality exceeded \
+             capacity of the categorical integer (type {}). Consider a \
+             wider index width.",
+            std::any::type_name::<T>()
+        )
+    });
+    unique_values.push(value.to_owned());
+    c
+}
 
 /// # CategoricalArray
 ///
@@ -104,16 +128,18 @@ use ::vec64::{Vec64, Vec64Alloc};
 pub struct CategoricalArray<T: Integer> {
     /// Indices buffer (references into the dictionary).
     pub data: Buffer<T>,
-    /// Append-only string dictionary that maps each unique value to the
-    /// integer code stored in `data`.
-    ///
-    /// Without the `shared_dict` feature, the dictionary is held inline
-    /// and mutated directly. Under `shared_dict`, the dictionary is an
-    /// `Arc<ArcSwap<...>>` handle; cloning the categorical clones the
-    /// dictionary handle, putting both arrays in the same sharing group.
-    /// `push_str` and the other mutators route through the dictionary's
-    /// atomic `intern`, so every clone in the group observes the same
-    /// codes for the same strings.
+    /// Append-only list of unique strings; position is the code stored
+    /// in `data`. Held inline and mutated directly when `shared_dict`
+    /// is off.
+    #[cfg(not(feature = "shared_dict"))]
+    pub unique_values: Vec64<String>,
+    /// Lock-free shared dictionary handle (contiguous `AppendOnlyVec`
+    /// for values + sharded reverse index). Cloning the categorical
+    /// clones the handle, putting both arrays in the same sharing
+    /// group; `push_str` and the other mutators route through the
+    /// dictionary's atomic `intern` so every clone in the group
+    /// observes the same codes for the same strings.
+    #[cfg(feature = "shared_dict")]
     pub dictionary: Dictionary<T>,
     /// Optional null mask (bit-packed; 1=valid, 0=null).
     pub null_mask: Option<Bitmask>,
@@ -152,7 +178,10 @@ impl<T: Integer> CategoricalArray<T> {
         }
 
         Self {
-            data: data,
+            data,
+            #[cfg(not(feature = "shared_dict"))]
+            unique_values,
+            #[cfg(feature = "shared_dict")]
             dictionary: Dictionary::from(unique_values),
             null_mask,
         }
@@ -191,9 +220,10 @@ impl<T: Integer> CategoricalArray<T> {
     ) -> Self {
         Self {
             data: Vec64::with_capacity(cap).into(),
-            dictionary: unique_values
-                .map(Dictionary::from)
-                .unwrap_or_default(),
+            #[cfg(not(feature = "shared_dict"))]
+            unique_values: unique_values.unwrap_or_default(),
+            #[cfg(feature = "shared_dict")]
+            dictionary: unique_values.map(Dictionary::from).unwrap_or_default(),
             null_mask: if null_mask {
                 Some(Bitmask::with_capacity(cap))
             } else {
@@ -239,6 +269,9 @@ impl<T: Integer> CategoricalArray<T> {
 
         Self {
             data: codes.into(),
+            #[cfg(not(feature = "shared_dict"))]
+            unique_values,
+            #[cfg(feature = "shared_dict")]
             dictionary: Dictionary::from(unique_values),
             null_mask,
         }
@@ -259,6 +292,9 @@ impl<T: Integer> CategoricalArray<T> {
     ) -> Self {
         Self {
             data: data.into(),
+            #[cfg(not(feature = "shared_dict"))]
+            unique_values,
+            #[cfg(feature = "shared_dict")]
             dictionary: Dictionary::from(unique_values),
             null_mask,
         }
@@ -277,15 +313,29 @@ impl<T: Integer> CategoricalArray<T> {
         let dict_values: Vec64<String> = Vec64(unique_values.to_vec_in(Vec64Alloc::default()));
         Self {
             data: Vec64(indices.to_vec_in(Vec64Alloc::default())).into(),
+            #[cfg(not(feature = "shared_dict"))]
+            unique_values: dict_values,
+            #[cfg(feature = "shared_dict")]
             dictionary: Dictionary::from(dict_values),
             null_mask: None,
         }
     }
 
     /// Returns the current dictionary values as a slice.
+    ///
+    /// Under `shared_dict` the dictionary may be updated concurrently
+    /// by other clones in the sharing group; this method returns the
+    /// published prefix at the moment of the call.
     #[inline]
     pub fn values(&self) -> &[String] {
-        self.dictionary.values()
+        #[cfg(not(feature = "shared_dict"))]
+        {
+            &self.unique_values
+        }
+        #[cfg(feature = "shared_dict")]
+        {
+            self.dictionary.values()
+        }
     }
 
     /// Returns the dictionary indices as a slice.
@@ -305,7 +355,7 @@ impl<T: Integer> CategoricalArray<T> {
 
     /// Returns an iterator of dictionary values (unique strings).
     pub fn values_iter(&self) -> Iter<'_, String> {
-        self.dictionary.values().iter()
+        self.values().iter()
     }
 
     /// Returns a mutable iterator over indices buffer.
@@ -327,7 +377,7 @@ impl<T: Integer> CategoricalArray<T> {
     /// participating chunk, so the operation is intentionally absent.
     #[cfg(not(feature = "shared_dict"))]
     pub fn values_iter_mut(&mut self) -> IterMut<'_, String> {
-        self.dictionary.values.iter_mut()
+        self.unique_values.iter_mut()
     }
 
     /// Extend with an iterator of &str.
@@ -340,10 +390,13 @@ impl<T: Integer> CategoricalArray<T> {
     /// Append string, adding to dictionary if new. Returns dictionary index used.
     #[inline]
     pub fn push_str(&mut self, value: &str) -> T {
-        let code = self.dictionary.intern(value).expect(
+        #[cfg(not(feature = "shared_dict"))]
+        let code: T = intern_into(&mut self.unique_values, value);
+        #[cfg(feature = "shared_dict")]
+        let code: T = self.dictionary.intern(value).expect(
             "Dictionary category interning failed: cardinality exceeded capacity \
              of the categorical integer. Consider a CategoricalArray<T> with a \
-             greater `T` capacity."
+             greater `T` capacity.",
         );
         self.data.push(code);
         let row = self.len() - 1;
@@ -372,7 +425,7 @@ impl<T: Integer> CategoricalArray<T> {
             return None;
         }
         let dict_idx = self.data[idx].to_usize();
-        Some(&self.dictionary.values()[dict_idx])
+        Some(&self.values()[dict_idx])
     }
 
     /// Like `get`, but skips bounds checks.
@@ -384,7 +437,7 @@ impl<T: Integer> CategoricalArray<T> {
             }
         }
         let dict_idx = unsafe { self.data.get_unchecked(idx).to_usize().unwrap() };
-        unsafe { self.dictionary.values().get_unchecked(dict_idx) }
+        unsafe { self.values().get_unchecked(dict_idx) }
     }
 
     /// Sets the value at `idx`. Marks as valid.
@@ -392,10 +445,13 @@ impl<T: Integer> CategoricalArray<T> {
     pub fn set_str(&mut self, idx: usize, value: &str) {
         assert!(idx < self.data.len(), "index out of bounds");
 
-        let code = self.dictionary.intern(value).expect(
+        #[cfg(not(feature = "shared_dict"))]
+        let code: T = intern_into(&mut self.unique_values, value);
+        #[cfg(feature = "shared_dict")]
+        let code: T = self.dictionary.intern(value).expect(
             "Dictionary category interning failed: cardinality exceeded capacity \
              of the categorical integer. Consider a CategoricalArray<T> with a \
-             greater `T` capacity."
+             greater `T` capacity.",
         );
 
         self.data[idx] = code;
@@ -412,10 +468,13 @@ impl<T: Integer> CategoricalArray<T> {
     /// Like `set`, but skips all bounds checks.
     #[inline(always)]
     pub unsafe fn set_str_unchecked(&mut self, idx: usize, value: &str) {
-        let code = self.dictionary.intern(value).expect(
+        #[cfg(not(feature = "shared_dict"))]
+        let code: T = intern_into(&mut self.unique_values, value);
+        #[cfg(feature = "shared_dict")]
+        let code: T = self.dictionary.intern(value).expect(
             "Dictionary category interning failed: cardinality exceeded capacity \
              of the categorical integer. Consider a CategoricalArray<T> with a \
-             greater `T` capacity."
+             greater `T` capacity.",
         );
         let data = self.data.as_mut_slice();
         data[idx] = code;
@@ -435,7 +494,7 @@ impl<T: Integer> CategoricalArray<T> {
             if self.is_null(idx) {
                 ""
             } else {
-                &self.dictionary.values()[dict_idx.to_usize()]
+                &self.values()[dict_idx.to_usize()]
             }
         })
     }
@@ -449,7 +508,7 @@ impl<T: Integer> CategoricalArray<T> {
             } else {
                 Some(unsafe {
                     std::mem::transmute::<&str, &'static str>(
-                        &self.dictionary.values()[dict_idx.to_usize()],
+                        &self.values()[dict_idx.to_usize()],
                     )
                 })
             }
@@ -467,7 +526,7 @@ impl<T: Integer> CategoricalArray<T> {
                 if self.is_null(idx) {
                     ""
                 } else {
-                    &self.dictionary.values()[dict_idx.to_usize()]
+                    &self.values()[dict_idx.to_usize()]
                 }
             })
     }
@@ -489,7 +548,7 @@ impl<T: Integer> CategoricalArray<T> {
                 } else {
                     Some(unsafe {
                         std::mem::transmute::<&str, &'static str>(
-                            &self.dictionary.values()[dict_idx.to_usize()],
+                            &self.values()[dict_idx.to_usize()],
                         )
                     })
                 }
@@ -514,6 +573,9 @@ impl<T: Integer> CategoricalArray<T> {
 
         Self {
             data: idx_buf.into(),
+            #[cfg(not(feature = "shared_dict"))]
+            unique_values: dict,
+            #[cfg(feature = "shared_dict")]
             dictionary: Dictionary::from(dict),
             null_mask: None,
         }
@@ -528,6 +590,9 @@ impl<T: Integer> CategoricalArray<T> {
     ) -> Self {
         Self {
             data: indices.into(),
+            #[cfg(not(feature = "shared_dict"))]
+            unique_values,
+            #[cfg(feature = "shared_dict")]
             dictionary: Dictionary::from(unique_values),
             null_mask,
         }
@@ -546,7 +611,7 @@ impl<T: Integer> CategoricalArray<T> {
                 offsets.push(T::from(data.len()).unwrap());
             } else {
                 let dict_idx = self.data[i].to_usize();
-                let s = &self.dictionary.values()[dict_idx];
+                let s = &self.values()[dict_idx];
                 data.extend_from_slice(s.as_bytes());
                 offsets.push(T::from(data.len()).unwrap());
             }
@@ -603,7 +668,7 @@ impl<T: Integer> MaskedArray for CategoricalArray<T> {
         let dict_idx = self.data[idx].to_usize();
 
         // SAFETY: Must not escape beyond the borrow lifetime of self.
-        Some(unsafe { std::mem::transmute::<&str, &'static str>(&self.dictionary.values()[dict_idx]) })
+        Some(unsafe { std::mem::transmute::<&str, &'static str>(&self.values()[dict_idx]) })
     }
 
     /// Sets the value at `idx`. Marks as valid.
@@ -642,7 +707,7 @@ impl<T: Integer> MaskedArray for CategoricalArray<T> {
 
         let dict_idx = unsafe { self.data.get_unchecked(idx).to_usize().unwrap() };
         Some(unsafe {
-            std::mem::transmute::<&str, &'static str>(self.dictionary.values().get_unchecked(dict_idx))
+            std::mem::transmute::<&str, &'static str>(self.values().get_unchecked(dict_idx))
         })
     }
 
@@ -651,10 +716,13 @@ impl<T: Integer> MaskedArray for CategoricalArray<T> {
     /// ⚠️ Prefer `set_str_unchecked` as it avoids a reallocation.
     #[inline]
     unsafe fn set_unchecked(&mut self, idx: usize, value: Self::LogicalType) {
-        let code = self.dictionary.intern(&value).expect(
+        #[cfg(not(feature = "shared_dict"))]
+        let code: T = intern_into(&mut self.unique_values, &value);
+        #[cfg(feature = "shared_dict")]
+        let code: T = self.dictionary.intern(&value).expect(
             "Dictionary category interning failed: cardinality exceeded capacity \
              of the categorical integer. Consider a CategoricalArray<T> with a \
-             greater `T` capacity."
+             greater `T` capacity.",
         );
         let data = self.data.as_mut_slice();
         data[idx] = code;
@@ -686,7 +754,7 @@ impl<T: Integer> MaskedArray for CategoricalArray<T> {
             } else {
                 unsafe {
                     std::mem::transmute::<&str, &'static str>(
-                        &self.dictionary.values()[dict_idx.to_usize()],
+                        &self.values()[dict_idx.to_usize()],
                     )
                 }
             }
@@ -710,7 +778,7 @@ impl<T: Integer> MaskedArray for CategoricalArray<T> {
             } else {
                 Some(unsafe {
                     std::mem::transmute::<&str, &'static str>(
-                        &self.dictionary.values()[dict_idx.to_usize()],
+                        &self.values()[dict_idx.to_usize()],
                     )
                 })
             }
@@ -733,7 +801,7 @@ impl<T: Integer> MaskedArray for CategoricalArray<T> {
                 } else {
                     unsafe {
                         std::mem::transmute::<&str, &'static str>(
-                            &self.dictionary.values()[dict_idx.to_usize()],
+                            &self.values()[dict_idx.to_usize()],
                         )
                     }
                 }
@@ -760,7 +828,7 @@ impl<T: Integer> MaskedArray for CategoricalArray<T> {
                 } else {
                     Some(unsafe {
                         std::mem::transmute::<&str, &'static str>(
-                            &self.dictionary.values()[dict_idx.to_usize()],
+                            &self.values()[dict_idx.to_usize()],
                         )
                     })
                 }
@@ -805,6 +873,9 @@ impl<T: Integer> MaskedArray for CategoricalArray<T> {
             .map(|nm| nm.slice_clone(offset, len));
         Self {
             data: Vec64(data).into(),
+            #[cfg(not(feature = "shared_dict"))]
+            unique_values: self.unique_values.clone(),
+            #[cfg(feature = "shared_dict")]
             dictionary: self.dictionary.clone(),
             null_mask,
         }
@@ -832,10 +903,13 @@ impl<T: Integer> MaskedArray for CategoricalArray<T> {
     fn resize(&mut self, n: usize, value: Self::LogicalType) {
         let current_len = self.len();
 
-        let encoded = self.dictionary.intern(&value).expect(
+        #[cfg(not(feature = "shared_dict"))]
+        let encoded: T = intern_into(&mut self.unique_values, &value);
+        #[cfg(feature = "shared_dict")]
+        let encoded: T = self.dictionary.intern(&value).expect(
             "Dictionary category interning failed: cardinality exceeded capacity \
              of the categorical integer. Consider a CategoricalArray<T> with a \
-             greater `T` capacity."
+             greater `T` capacity.",
         );
 
         if n > current_len {
@@ -936,20 +1010,31 @@ impl<T: Integer> MaskedArray for CategoricalArray<T> {
         }
 
         // Build a mapping from `other`'s dictionary indices into self's.
-        // The common path is a pure lookup against self's snapshot, which
-        // works whether self is Owned or Shared. Growth on self is only
-        // attempted when `other` carries a value self has never seen; if
-        // self is Shared at that point the error is returned via `?` so
-        // the caller can route the growth through the parent's `intern`
-        // method instead of panicking from inside this function.
-        let mut index_map: Vec<T> = Vec::with_capacity(other.dictionary.len());
-        for other_value in other.dictionary.values().iter() {
-            let code = match self.dictionary.lookup(other_value) {
-                Some(code) => code,
-                None => self.dictionary.intern(other_value)?,
-            };
-            index_map.push(code);
-        }
+        // Pure lookup if the string already exists in self; otherwise
+        // intern it. Under `shared_dict`, intern returns an error on
+        // cap overflow which is propagated via `?`; under no-feature
+        // the linear-scan helper panics on overflow (matches pre-PR
+        // `push_str` semantics).
+        #[cfg(not(feature = "shared_dict"))]
+        let index_map: Vec<T> = {
+            let mut m = Vec::with_capacity(other.unique_values.len());
+            for other_value in other.unique_values.iter() {
+                m.push(intern_into(&mut self.unique_values, other_value));
+            }
+            m
+        };
+        #[cfg(feature = "shared_dict")]
+        let index_map: Vec<T> = {
+            let mut m = Vec::with_capacity(other.dictionary.len());
+            for other_value in other.dictionary.values().iter() {
+                let code = match self.dictionary.lookup(other_value) {
+                    Some(code) => code,
+                    None => self.dictionary.intern(other_value)?,
+                };
+                m.push(code);
+            }
+            m
+        };
 
         // Insert and remap other's data
         let new_len = orig_len + other_len;
@@ -1040,9 +1125,13 @@ impl<T: Integer> MaskedArray for CategoricalArray<T> {
         // Split null mask
         let after_mask = self.null_mask.as_mut().map(|mask| mask.split_off(index));
 
-        // Both arrays share the same dictionary via Arc, no deep clone.
+        // Both arrays share the same dictionary handle (cheap clone:
+        // a `Vec64` clone under no `shared_dict`; an Arc bump under it).
         let after = CategoricalArray {
             data: after_data,
+            #[cfg(not(feature = "shared_dict"))]
+            unique_values: self.unique_values.clone(),
+            #[cfg(feature = "shared_dict")]
             dictionary: self.dictionary.clone(),
             null_mask: after_mask,
         };
@@ -1066,15 +1155,15 @@ impl<T: Integer> MaskedArray for CategoricalArray<T> {
         if let Some(mask) = &mut self.null_mask {
             mask.resize(start_len + values.len(), true);
         }
-        // If the dictionary is currently Shared, demote it to Owned before
-        // writing. The existing codes keep their meaning and from here on
-        // additions are private to this categorical.
         for (i, value) in values.iter().enumerate() {
             let owned = value.to_string();
-            let code = self.dictionary.intern(&owned).expect(
+            #[cfg(not(feature = "shared_dict"))]
+            let code: T = intern_into(&mut self.unique_values, &owned);
+            #[cfg(feature = "shared_dict")]
+            let code: T = self.dictionary.intern(&owned).expect(
                 "Dictionary category interning failed: cardinality exceeded capacity \
                  of the categorical integer. Consider a CategoricalArray<T> with a \
-                 greater `T` capacity."
+                 greater `T` capacity.",
             );
             {
                 let data = self.data.as_mut_slice();
@@ -1098,13 +1187,15 @@ impl<T: Integer> MaskedArray for CategoricalArray<T> {
         if let Some(mask) = &mut self.null_mask {
             mask.resize(start_len + slice.len(), true);
         }
-        // Demote a Shared dictionary to Owned before writing.
         for (i, value) in slice.iter().enumerate() {
             let owned = value.to_string();
-            let code = self.dictionary.intern(&owned).expect(
+            #[cfg(not(feature = "shared_dict"))]
+            let code: T = intern_into(&mut self.unique_values, &owned);
+            #[cfg(feature = "shared_dict")]
+            let code: T = self.dictionary.intern(&owned).expect(
                 "Dictionary category interning failed: cardinality exceeded capacity \
                  of the categorical integer. Consider a CategoricalArray<T> with a \
-                 greater `T` capacity."
+                 greater `T` capacity.",
             );
             {
                 let data = self.data.as_mut_slice();
@@ -1123,12 +1214,15 @@ impl<T: Integer> MaskedArray for CategoricalArray<T> {
         let mut array = CategoricalArray::<T>::from_vec64(crate::Vec64::with_capacity(count), None);
         // Extend the length to accommodate new elements
         array.data.resize(count, T::from_usize(0));
-        // Fresh array, dictionary is Owned and empty; interning one value
-        // here cannot overflow the index type.
-        let dict_index = array.dictionary.intern(&value.to_string()).expect(
+        // Fresh array; dictionary holds one entry once we intern.
+        let owned_value = value.to_string();
+        #[cfg(not(feature = "shared_dict"))]
+        let dict_index: T = intern_into(&mut array.unique_values, &owned_value);
+        #[cfg(feature = "shared_dict")]
+        let dict_index: T = array.dictionary.intern(&owned_value).expect(
             "Dictionary category interning failed: cardinality exceeded capacity \
              of the categorical integer. Consider a CategoricalArray<T> with a \
-             greater `T` capacity."
+             greater `T` capacity.",
         );
         // Now use unchecked operations since we have proper length
         for i in 0..count {
@@ -1170,7 +1264,7 @@ impl<T: Integer + Send + Sync> CategoricalArray<T> {
     ) -> impl ParallelIterator<Item = &str> + '_ {
         use rayon::prelude::*;
         let null_mask = self.null_mask.as_ref();
-        let dict = &self.dictionary;
+        let dict = self.values();
         let idx_buf = &self.data;
         debug_assert!(start <= end && end <= idx_buf.len());
         (start..end).into_par_iter().map(move |i| {
@@ -1191,7 +1285,7 @@ impl<T: Integer + Send + Sync> CategoricalArray<T> {
     ) -> impl ParallelIterator<Item = Option<&str>> + '_ {
         use rayon::prelude::*;
         let null_mask = self.null_mask.as_ref();
-        let dict = &self.dictionary;
+        let dict = self.values();
         let idx_buf = &self.data;
         debug_assert!(start <= end && end <= idx_buf.len());
         (start..end).into_par_iter().map(move |i| {
@@ -1212,7 +1306,7 @@ impl<T: Integer + Send + Sync> CategoricalArray<T> {
     ) -> impl rayon::prelude::ParallelIterator<Item = &str> + '_ {
         use rayon::prelude::*;
         let null_mask = self.null_mask.as_ref();
-        let dict = &self.dictionary;
+        let dict = self.values();
         let idx_buf = &self.data;
         (start..end).into_par_iter().map(move |i| {
             if let Some(mask) = null_mask {
@@ -1234,7 +1328,7 @@ impl<T: Integer + Send + Sync> CategoricalArray<T> {
     ) -> impl rayon::prelude::ParallelIterator<Item = Option<&str>> + '_ {
         use rayon::prelude::*;
         let null_mask = self.null_mask.as_ref();
-        let dict = &self.dictionary;
+        let dict = self.values();
         let idx_buf = &self.data;
         (start..end).into_par_iter().map(move |i| {
             if let Some(mask) = null_mask {
@@ -1306,13 +1400,12 @@ impl<'a, T: Integer> crate::traits::consolidate::Consolidate
                     current_len += *len;
                 }
 
-                let snapshot = first_dict
-                    .as_shared()
-                    .expect("first chunk is Shared by all_same_dict above")
-                    .clone();
+                // `Dictionary` is always Arc-backed under `shared_dict`;
+                // clone bumps the Arc to join the same sharing group.
+                let dict_handle = first_dict.clone();
                 return CategoricalArray::<T>::with_dictionary(
                     result_data,
-                    snapshot,
+                    dict_handle,
                     result_mask,
                 );
             }
@@ -1364,26 +1457,45 @@ impl<T: Integer> Concatenate for CategoricalArray<T> {
             return Ok(self);
         }
 
-        let share = self.dictionary.shares_with(&other.dictionary);
-        if share {
-            // Same dictionary instance: pure buffer concat.
-            self.data.extend_from_slice(other.data.as_ref());
-        } else if other.dictionary.is_prefix_of(&self.dictionary) {
-            // `other`'s codes are already valid against the longer `self` dictionary.
-            self.data.extend_from_slice(other.data.as_ref());
-        } else if self.dictionary.is_prefix_of(&other.dictionary) {
-            // `self`'s codes are valid against the longer `other` dictionary.
-            // Adopt `other`'s dictionary and append `other`'s data verbatim.
-            self.dictionary = other.dictionary.clone();
-            self.data.extend_from_slice(other.data.as_ref());
-        } else {
-            // Divergent: bring missing entries from other into self's
-            // dictionary, then remap other's codes through the union.
-            let n_other_codes = other.dictionary.len();
-            let mut remap: Vec<T> = Vec::with_capacity(n_other_codes);
-            for other_value in other.dictionary.values().iter() {
-                let code = self.dictionary.intern(other_value)?;
-                remap.push(code);
+        #[cfg(feature = "shared_dict")]
+        {
+            let share = self.dictionary.shares_with(&other.dictionary);
+            if share {
+                // Same dictionary instance: pure buffer concat.
+                self.data.extend_from_slice(other.data.as_ref());
+            } else if other.dictionary.values().len() <= self.dictionary.values().len()
+                && other.dictionary.is_prefix_of(&self.dictionary)
+            {
+                // `other`'s codes are already valid against the longer `self` dictionary.
+                self.data.extend_from_slice(other.data.as_ref());
+            } else if self.dictionary.is_prefix_of(&other.dictionary) {
+                // `self`'s codes are valid against the longer `other` dictionary.
+                // Adopt `other`'s dictionary and append `other`'s data verbatim.
+                self.dictionary = other.dictionary.clone();
+                self.data.extend_from_slice(other.data.as_ref());
+            } else {
+                // Divergent: bring missing entries from other into self's
+                // dictionary, then remap other's codes through the union.
+                let n_other_codes = other.dictionary.values().len();
+                let mut remap: Vec<T> = Vec::with_capacity(n_other_codes);
+                for other_value in other.dictionary.values().iter() {
+                    let code = self.dictionary.intern(other_value)?;
+                    remap.push(code);
+                }
+                for &other_code in other.data.iter() {
+                    let mapped = remap[other_code.to_usize()];
+                    self.data.push(mapped);
+                }
+            }
+        }
+        #[cfg(not(feature = "shared_dict"))]
+        {
+            // Without `shared_dict` each categorical owns its dictionary
+            // outright; merge by interning every entry of `other`'s
+            // dictionary into `self`'s, then remap `other`'s codes.
+            let mut remap: Vec<T> = Vec::with_capacity(other.unique_values.len());
+            for other_value in other.unique_values.iter() {
+                remap.push(intern_into(&mut self.unique_values, other_value));
             }
             for &other_code in other.data.iter() {
                 let mapped = remap[other_code.to_usize()];
@@ -1435,7 +1547,7 @@ where
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let len = self.len();
         let null_count = self.null_count();
-        let dict_size = self.dictionary.len();
+        let dict_size = self.values().len();
 
         writeln!(
             f,
@@ -1587,12 +1699,11 @@ mod tests {
 
     #[test]
     fn test_categorical_array_slice() {
-        let mut arr = CategoricalArray::<u8>::default();
-        arr.data.extend_from_slice(&[2, 1, 0]);
-        arr.dictionary.intern("green").unwrap();
-        arr.dictionary.intern("blue").unwrap();
-        arr.dictionary.intern("red").unwrap();
-        arr.null_mask = Some(Bitmask::from_bools(&[false, true, true]));
+        let arr = CategoricalArray::<u8>::new(
+            vec64![2u8, 1, 0],
+            vec64!["green".to_string(), "blue".to_string(), "red".to_string()],
+            Some(Bitmask::from_bools(&[false, true, true])),
+        );
         let sliced = arr.slice_clone(0, 3);
         assert_eq!(
             sliced.iter_str_opt().collect::<Vec<_>>(),
@@ -1610,14 +1721,14 @@ mod tests {
         arr.set_str(1, "d");
         assert_eq!(arr.get(1), Some("d"));
         // dictionary should have "d" appended
-        assert_eq!(arr.dictionary.len(), 4);
-        assert!(arr.dictionary.values().contains(&"d".to_string()));
+        assert_eq!(arr.values().len(), 4);
+        assert!(arr.values().contains(&"d".to_string()));
 
         // set index 2 to existing "a"
         arr.set_str(2, "a");
         assert_eq!(arr.get(2), Some("a"));
         // dictionary length unchanged
-        assert_eq!(arr.dictionary.len(), 4);
+        assert_eq!(arr.values().len(), 4);
     }
 
     #[test]
@@ -1633,7 +1744,7 @@ mod tests {
         let mask = arr.null_mask.as_ref().unwrap();
         assert!(mask.get(1));
         // dictionary should contain "w"
-        assert!(arr.dictionary.values().contains(&"w".to_string()));
+        assert!(arr.values().contains(&"w".to_string()));
     }
 
     #[test]
@@ -1735,7 +1846,7 @@ mod tests {
         assert_eq!(arr.get(3), Some("bird"));
 
         // Dictionary should have 3 unique values
-        assert_eq!(arr.dictionary.len(), 3);
+        assert_eq!(arr.values().len(), 3);
     }
 
     #[test]
@@ -1757,7 +1868,7 @@ mod tests {
         assert_eq!(arr.get(3), Some("apple"));
 
         // Dictionary: initial, apple, banana
-        assert_eq!(arr.dictionary.len(), 3);
+        assert_eq!(arr.values().len(), 3);
     }
 
     #[test]
@@ -1773,8 +1884,8 @@ mod tests {
         }
 
         // Dictionary should contain only one unique value
-        assert_eq!(arr.dictionary.len(), 1);
-        assert_eq!(arr.dictionary.values()[0], "repeated");
+        assert_eq!(arr.values().len(), 1);
+        assert_eq!(arr.values()[0], "repeated");
 
         // All indices should point to the same dictionary entry (0)
         for i in 0..100 {
@@ -1799,7 +1910,7 @@ mod tests {
         assert!(arr.null_count() >= 1); // At least the initial null
 
         // Dictionary: first, second
-        assert!(arr.dictionary.len() >= 2); // At least first and second
+        assert!(arr.values().len() >= 2); // At least first and second
     }
 
     #[test]
@@ -1818,7 +1929,7 @@ mod tests {
         arr.extend_from_slice(&data);
 
         assert_eq!(arr.len(), 300);
-        assert_eq!(arr.dictionary.len(), 3); // Only 3 unique despite 300 entries
+        assert_eq!(arr.values().len(), 3); // Only 3 unique despite 300 entries
 
         // Verify all categories are represented correctly
         for i in 0..300 {
