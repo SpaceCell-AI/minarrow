@@ -51,7 +51,7 @@ ryu = { version = "1.0.23", optional = true }
 memchr = { version = "2.8.0", optional = true }
 ahash = { version = "0.8.12", optional = true }
 regex = { version = "1.12.3", optional = true }
-vec64 = { version = "0.4.3" }
+vec64 = { version = "0.4.5", path = "../../vec64" }
 log = "0.4.29"
 
 [dev-dependencies]
@@ -198,17 +198,21 @@ fast_hash = ["dep:ahash"]
 # Enables cross-batch shared categorical dictionaries.
 #
 # Under this feature, `Dictionary<T>` wraps an `Arc<DictionaryInner<T>>`
-# whose value array is a lock-free append-only Vec with stable element
-# addresses and whose reverse index is a `Mutex<HashMap>` touched only
-# during `intern`. Cloning the dictionary is an Arc bump on the inner;
-# every clone observes the same updates with no fork on write. The
-# `CategoryDispatch` width-erased holder on `SuperTable` and `SuperArray`
-# keeps a clone of each categorical column's dictionary so live ingestion
-# extends the shared store once and every sibling batch stays coherent.
+# whose value array is the lock-free `AppendOnlyVec<String>` from
+# `vec64` (with stable element addresses) and whose reverse index is a
+# sharded `Mutex<HashMap>` touched only during `intern`. Cloning the
+# dictionary is an Arc bump on the inner; every clone observes the
+# same updates with no fork on write. The `CategoryDispatch`
+# width-erased holder on `SuperTable` and `SuperArray` keeps a clone
+# of each categorical column's dictionary so live ingestion extends
+# the shared store once and every sibling batch stays coherent.
 #
-# Without this feature, every `CategoricalArray<T>` owns its dictionary
-# outright and codes are not mutually meaningful across batches.
-shared_dict = ["chunked"]
+# Activates `vec64/append_only_vec` to pull in `AppendOnlyVec`.
+#
+# Without this feature, every `CategoricalArray<T>` owns its
+# dictionary outright and codes are not mutually meaningful across
+# batches.
+shared_dict = ["chunked", "vec64/append_only_vec"]
 
 # Adds typed arithmetic broadcasting for add, sub, mult, div, rem
 broadcast = []

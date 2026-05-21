@@ -176,8 +176,6 @@ pub mod structs {
     pub mod buffer;
     pub mod column;
     #[cfg(feature = "shared_dict")]
-    pub mod append_only_vec;
-    #[cfg(feature = "shared_dict")]
     pub mod dictionary;
     #[cfg(feature = "cube")]
     pub mod cube;

@@ -55,7 +55,7 @@ use std::sync::{Arc, Mutex};
 
 use ::vec64::Vec64;
 
-use crate::structs::append_only_vec::AppendOnlyVec;
+use ::vec64::AppendOnlyVec;
 use crate::traits::type_unions::Integer;
 
 #[cfg(feature = "fast_hash")]
