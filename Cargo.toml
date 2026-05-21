@@ -50,7 +50,6 @@ zstd = { version = "0.13.3", optional = true }
 ryu = { version = "1.0.23", optional = true }
 memchr = { version = "2.8.0", optional = true }
 ahash = { version = "0.8.12", optional = true }
-arc_swap = { package = "arc-swap", version = "1.7", optional = true }
 regex = { version = "1.12.3", optional = true }
 vec64 = { version = "0.4.3" }
 log = "0.4.29"
@@ -196,29 +195,20 @@ str_arithmetic = ["ryu", "memchr"]
 # and categorical dictionary interning with the faster ahash.
 fast_hash = ["dep:ahash"]
 
-# Enables cross-batch shared categorical dictionaries. Adds:
-# - `Dictionary::Shared(Arc<DictionaryInner<T>>)` for snapshot-based read
-#   sharing across batches that point at a common dictionary store.
-# - `CategoryManager<T>` writer-side handle that owns the store and
-#   exposes concurrent `intern` against it.
-# - `CategoryDispatch` width-erased holder used by parents (`SuperTable`)
-#   to keep one manager per categorical column.
-# - `SuperTable`'s absorb path that intern-merges each pushed batch's
-#   dictionary into the column's manager and rebinds the batch to a
-#   `Shared` snapshot.
+# Enables cross-batch shared categorical dictionaries.
+#
+# Under this feature, `Dictionary<T>` wraps an `Arc<DictionaryInner<T>>`
+# whose value array is a lock-free append-only Vec with stable element
+# addresses and whose reverse index is a `Mutex<HashMap>` touched only
+# during `intern`. Cloning the dictionary is an Arc bump on the inner;
+# every clone observes the same updates with no fork on write. The
+# `CategoryDispatch` width-erased holder on `SuperTable` and `SuperArray`
+# keeps a clone of each categorical column's dictionary so live ingestion
+# extends the shared store once and every sibling batch stays coherent.
 #
 # Without this feature, every `CategoricalArray<T>` owns its dictionary
 # outright and codes are not mutually meaningful across batches.
 shared_dict = ["chunked"]
-
-# Swaps `CategoryManager`'s default `Mutex<Arc<DictionaryInner<T>>>` storage
-# for `arc_swap::ArcSwap<DictionaryInner<T>>`. The lock-free CAS-retry write
-# path is useful when concurrent novel-value insertion on a shared
-# categorical dictionary is a hot path (heavy multi-thread ingestion of
-# genuinely new strings). Reads on `Shared` snapshots are lock-free under
-# both backends, so this only really matters under genuine write contention
-# (or where mutex acquisition latency would otherwise dominate).
-contended_dict = ["shared_dict", "dep:arc_swap"]
 
 # Adds typed arithmetic broadcasting for add, sub, mult, div, rem
 broadcast = []

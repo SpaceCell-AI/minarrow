@@ -37,8 +37,6 @@
 use std::collections::HashMap;
 use std::fmt::{Debug, Display, Formatter};
 use std::slice::{Iter, IterMut};
-#[cfg(feature = "shared_dict")]
-use std::sync::Arc;
 
 #[cfg(feature = "parallel_proc")]
 use rayon::iter::ParallelIterator;
@@ -47,8 +45,6 @@ use crate::aliases::CategoricalAVT;
 use crate::enums::error::MinarrowError;
 use crate::enums::shape_dim::ShapeDim;
 use crate::structs::dictionary::Dictionary;
-#[cfg(feature = "shared_dict")]
-use crate::structs::dictionary::DictionaryInner;
 use crate::traits::concatenate::Concatenate;
 use crate::traits::shape::Shape;
 use crate::traits::type_unions::Integer;
@@ -108,41 +104,16 @@ use ::vec64::{Vec64, Vec64Alloc};
 pub struct CategoricalArray<T: Integer> {
     /// Indices buffer (references into the dictionary).
     pub data: Buffer<T>,
-    /// The append-only string dictionary that maps each unique value to the
-    /// integer code stored in `data`. `Dictionary<T>` is an enum whose
-    /// variant encodes the ownership mode, so the same field type covers
-    /// both standalone and shared cases.
+    /// Append-only string dictionary that maps each unique value to the
+    /// integer code stored in `data`.
     ///
-    /// When this categorical is standalone, the variant is
-    /// `Dictionary::Owned(...)` and the categorical mutates its dictionary
-    /// directly. When this categorical is held inside a `SuperTable`,
-    /// `SuperArray`, or peer-synced set, the variant is
-    /// `Dictionary::Shared(Arc<...>)`: an immutable snapshot of a single
-    /// dictionary owned by the parent's `CategoryManager`.
-    ///
-    /// Read access is identical in both modes. Growth on a `Shared`
-    /// dictionary cannot be performed from this categorical, since doing
-    /// so would diverge it from its siblings. New values must be requested
-    /// from the parent via its `intern` method, which extends the shared
-    /// dictionary once and returns a code that remains valid against every
-    /// sibling snapshot under the append-only invariant.
-    ///
-    /// Most of this is managed for the caller. Standalone categoricals
-    /// grow their own dictionaries through `push_str` without any further
-    /// involvement, and when a batch is pushed into a `SuperTable` or
-    /// `SuperArray` the parent merges the batch's `Owned` dictionary into
-    /// its `CategoryManager` and rebinds the categorical to the resulting
-    /// `Shared` snapshot. Reads, slices, splits, and concatenation of
-    /// matching `Shared` snapshots all flow through without caller
-    /// intervention. The one path the caller is responsible for is direct
-    /// growth of a categorical whose dictionary is already `Shared`:
-    /// attempting that returns `DictionaryError::Shared` rather than
-    /// silently desynchronising. In that case the caller routes the value
-    /// through the parent's `intern` method, which is the recommended
-    /// entry point for any live ingestion against a categorical that has
-    /// been absorbed into a parent container, or, alternatively, a
-    /// standalone `CategoryManager` for managing multiple disparate
-    /// `CategoricalArray`s without a parent at all.
+    /// Without the `shared_dict` feature, the dictionary is held inline
+    /// and mutated directly. Under `shared_dict`, the dictionary is an
+    /// `Arc<ArcSwap<...>>` handle; cloning the categorical clones the
+    /// dictionary handle, putting both arrays in the same sharing group.
+    /// `push_str` and the other mutators route through the dictionary's
+    /// atomic `intern`, so every clone in the group observes the same
+    /// codes for the same strings.
     pub dictionary: Dictionary<T>,
     /// Optional null mask (bit-packed; 1=valid, 0=null).
     pub null_mask: Option<Bitmask>,
@@ -187,24 +158,24 @@ impl<T: Integer> CategoricalArray<T> {
         }
     }
 
-    /// Constructs a `CategoricalArray` against a pre-existing shared
-    /// `Arc<DictionaryInner<T>>`. The resulting array's codes are
-    /// interpreted against that dictionary, so they remain mutually
-    /// meaningful with any other array built against the same Arc. This
-    /// is the path used by streaming batch consolidation and by FFI
-    /// imports that have already deduplicated dictionaries upstream.
+    /// Constructs a `CategoricalArray` that joins an existing dictionary's
+    /// sharing group. The provided `Dictionary` is cloned (Arc bump), so
+    /// the resulting array's codes are mutually meaningful with every
+    /// other array sharing that dictionary. Used by streaming batch
+    /// consolidation and by FFI imports that have already deduplicated
+    /// dictionaries upstream.
     #[cfg(feature = "shared_dict")]
     #[inline]
     pub fn with_dictionary(
         data: impl Into<Buffer<T>>,
-        snapshot: Arc<DictionaryInner<T>>,
+        dictionary: Dictionary<T>,
         null_mask: Option<Bitmask>,
     ) -> Self {
         let data: Buffer<T> = data.into();
         validate_null_mask_len(data.len(), &null_mask);
         Self {
             data,
-            dictionary: Dictionary::Shared(snapshot),
+            dictionary,
             null_mask,
         }
     }
@@ -344,25 +315,19 @@ impl<T: Integer> CategoricalArray<T> {
 
     /// Returns a mutable iterator over dictionary values.
     ///
-    /// Forks the shared dictionary via `Arc::make_mut` before exposing the
-    /// mutable iterator, so other holders of the previous Arc are unaffected.
-    ///
     /// # Warning
     /// The dictionary's append-only invariant means existing entries are
     /// never reordered or replaced in normal use. Mutating an existing value
     /// at position `k` will silently invalidate every code `k` already
     /// assigned against this array's data buffer. Use only when you understand
     /// that consequence; prefer `push_str` for adding new values.
+    ///
+    /// Only available without the `shared_dict` feature - mutating existing
+    /// dictionary entries through a sharing group would corrupt every
+    /// participating chunk, so the operation is intentionally absent.
+    #[cfg(not(feature = "shared_dict"))]
     pub fn values_iter_mut(&mut self) -> IterMut<'_, String> {
-        match &mut self.dictionary {
-            Dictionary::Owned(inner) => inner.values.iter_mut(),
-            #[cfg(feature = "shared_dict")]
-            Dictionary::Shared(_) => panic!(
-                "CategoricalArray's dictionary is Shared; values_iter_mut would \
-                 desynchronise it from sibling batches. Promote the dictionary \
-                 to Owned first if you genuinely need to mutate existing entries."
-            ),
-        }
+        self.dictionary.values.iter_mut()
     }
 
     /// Extend with an iterator of &str.
@@ -375,7 +340,6 @@ impl<T: Integer> CategoricalArray<T> {
     /// Append string, adding to dictionary if new. Returns dictionary index used.
     #[inline]
     pub fn push_str(&mut self, value: &str) -> T {
-        self.dictionary.demote_to_owned();
         let code = self.dictionary.intern(value).expect(
             "Dictionary category interning failed: cardinality exceeded capacity \
              of the categorical integer. Consider a CategoricalArray<T> with a \
@@ -428,7 +392,6 @@ impl<T: Integer> CategoricalArray<T> {
     pub fn set_str(&mut self, idx: usize, value: &str) {
         assert!(idx < self.data.len(), "index out of bounds");
 
-        self.dictionary.demote_to_owned();
         let code = self.dictionary.intern(value).expect(
             "Dictionary category interning failed: cardinality exceeded capacity \
              of the categorical integer. Consider a CategoricalArray<T> with a \
@@ -449,7 +412,6 @@ impl<T: Integer> CategoricalArray<T> {
     /// Like `set`, but skips all bounds checks.
     #[inline(always)]
     pub unsafe fn set_str_unchecked(&mut self, idx: usize, value: &str) {
-        self.dictionary.demote_to_owned();
         let code = self.dictionary.intern(value).expect(
             "Dictionary category interning failed: cardinality exceeded capacity \
              of the categorical integer. Consider a CategoricalArray<T> with a \
@@ -689,7 +651,6 @@ impl<T: Integer> MaskedArray for CategoricalArray<T> {
     /// ⚠️ Prefer `set_str_unchecked` as it avoids a reallocation.
     #[inline]
     unsafe fn set_unchecked(&mut self, idx: usize, value: Self::LogicalType) {
-        self.dictionary.demote_to_owned();
         let code = self.dictionary.intern(&value).expect(
             "Dictionary category interning failed: cardinality exceeded capacity \
              of the categorical integer. Consider a CategoricalArray<T> with a \
@@ -871,7 +832,6 @@ impl<T: Integer> MaskedArray for CategoricalArray<T> {
     fn resize(&mut self, n: usize, value: Self::LogicalType) {
         let current_len = self.len();
 
-        self.dictionary.demote_to_owned();
         let encoded = self.dictionary.intern(&value).expect(
             "Dictionary category interning failed: cardinality exceeded capacity \
              of the categorical integer. Consider a CategoricalArray<T> with a \
@@ -1109,7 +1069,6 @@ impl<T: Integer> MaskedArray for CategoricalArray<T> {
         // If the dictionary is currently Shared, demote it to Owned before
         // writing. The existing codes keep their meaning and from here on
         // additions are private to this categorical.
-        self.dictionary.demote_to_owned();
         for (i, value) in values.iter().enumerate() {
             let owned = value.to_string();
             let code = self.dictionary.intern(&owned).expect(
@@ -1140,7 +1099,6 @@ impl<T: Integer> MaskedArray for CategoricalArray<T> {
             mask.resize(start_len + slice.len(), true);
         }
         // Demote a Shared dictionary to Owned before writing.
-        self.dictionary.demote_to_owned();
         for (i, value) in slice.iter().enumerate() {
             let owned = value.to_string();
             let code = self.dictionary.intern(&owned).expect(
@@ -1421,7 +1379,6 @@ impl<T: Integer> Concatenate for CategoricalArray<T> {
         } else {
             // Divergent: bring missing entries from other into self's
             // dictionary, then remap other's codes through the union.
-            self.dictionary.demote_to_owned();
             let n_other_codes = other.dictionary.len();
             let mut remap: Vec<T> = Vec::with_capacity(n_other_codes);
             for other_value in other.dictionary.values().iter() {
