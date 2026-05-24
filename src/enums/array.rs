@@ -3073,11 +3073,22 @@ impl Array {
     }
 }
 
+/// Reinterpret-cast a `&[U]` window to `&[T]` when the caller has separately
+/// established that `U` and `T` are layout-compatible. Used by variant
+/// dispatch sites in this crate that already pattern-match on the concrete
+/// inner type.
 #[inline(always)]
-pub fn cast_slice<'a, U, T>(data: &'a [U], offset: usize, len: usize) -> Option<&'a [T]> {
-    // Safety: The caller is matching on a specific variant where U == T.
-    // Only returns Some if bounds are valid.
-    debug_assert_eq!(std::mem::size_of::<U>(), std::mem::size_of::<T>());
+pub(crate) fn cast_slice<'a, U, T>(data: &'a [U], offset: usize, len: usize) -> Option<&'a [T]> {
+    assert_eq!(
+        std::mem::size_of::<U>(),
+        std::mem::size_of::<T>(),
+        "cast_slice: size mismatch between U and T"
+    );
+    assert_eq!(
+        std::mem::align_of::<U>(),
+        std::mem::align_of::<T>(),
+        "cast_slice: alignment mismatch between U and T"
+    );
     if offset.checked_add(len)? > data.len() {
         return None;
     }
@@ -3361,6 +3372,74 @@ macro_rules! arr_i64 {
     }};
     () => {
         $crate::Array::from_int64($crate::IntegerArray::<i64>::from_vec64(vec64![], None))
+    };
+}
+
+// ======== Datetime (i32) ========
+
+/// Build an `Array` of i32-backed datetimes. The time unit is
+/// required and precedes the values, separated by `;`.
+///
+/// ```ignore
+/// use minarrow::ffi::arrow_dtype::TimeUnit;
+/// let a = arr_dt32![TimeUnit::Seconds; 1_768_521_600, 1_775_865_600];
+/// let b = arr_dt32![TimeUnit::Milliseconds; vec64![1, 2, 3]];
+/// ```
+#[cfg(feature = "datetime")]
+#[macro_export]
+macro_rules! arr_dt32 {
+    ($unit:expr; $v:expr) => {
+        $crate::Array::from_datetime_i32($crate::DatetimeArray::<i32>::from_vec64(
+            $v, None, Some($unit),
+        ))
+    };
+    ($unit:expr; $($x:expr),+ $(,)?) => {{
+        use $crate::vec64;
+        let temp_vec = vec64![$($x),+];
+        $crate::Array::from_datetime_i32($crate::DatetimeArray::<i32>::from_vec64(
+            temp_vec, None, Some($unit),
+        ))
+    }};
+    ($unit:expr;) => {
+        $crate::Array::from_datetime_i32($crate::DatetimeArray::<i32>::from_vec64(
+            $crate::Vec64::new(),
+            None,
+            Some($unit),
+        ))
+    };
+}
+
+// ======== Datetime (i64) ========
+
+/// Build an `Array` of i64-backed datetimes. The time unit is
+/// required and precedes the values, separated by `;`.
+///
+/// ```ignore
+/// use minarrow::ffi::arrow_dtype::TimeUnit;
+/// let a = arr_dt64![TimeUnit::Seconds; 1_768_521_600, 1_775_865_600];
+/// let b = arr_dt64![TimeUnit::Milliseconds; vec64![1, 2, 3]];
+/// ```
+#[cfg(feature = "datetime")]
+#[macro_export]
+macro_rules! arr_dt64 {
+    ($unit:expr; $v:expr) => {
+        $crate::Array::from_datetime_i64($crate::DatetimeArray::<i64>::from_vec64(
+            $v, None, Some($unit),
+        ))
+    };
+    ($unit:expr; $($x:expr),+ $(,)?) => {{
+        use $crate::vec64;
+        let temp_vec = vec64![$($x),+];
+        $crate::Array::from_datetime_i64($crate::DatetimeArray::<i64>::from_vec64(
+            temp_vec, None, Some($unit),
+        ))
+    }};
+    ($unit:expr;) => {
+        $crate::Array::from_datetime_i64($crate::DatetimeArray::<i64>::from_vec64(
+            $crate::Vec64::new(),
+            None,
+            Some($unit),
+        ))
     };
 }
 
