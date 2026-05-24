@@ -75,18 +75,17 @@ pub enum MinarrowError {
         source: &'static str,
         message: String,
     },
-    /// Raised by a categorical dictionary operation when the new
-    /// cardinality would exceed the index type's capacity. Only present
-    /// under `shared_dict`; without the feature, categorical mutators
-    /// panic on overflow instead, matching pre-PR semantics.
-    #[cfg(feature = "shared_dict")]
-    DictionaryError(DictionaryError),
+    /// Raised when a categorical operation would exceed the index type's
+    /// cardinality, e.g. a 257th unique value on a `u8` categorical.
+    DictionaryOverflow,
 }
 
 #[cfg(feature = "shared_dict")]
 impl From<DictionaryError> for MinarrowError {
     fn from(source: DictionaryError) -> Self {
-        MinarrowError::DictionaryError(source)
+        match source {
+            DictionaryError::Overflow => MinarrowError::DictionaryOverflow,
+        }
     }
 }
 
@@ -170,9 +169,11 @@ impl fmt::Display for MinarrowError {
             MinarrowError::BridgeError { source, message } => {
                 write!(f, "Bridge error ({}): {}", source, message)
             }
-            #[cfg(feature = "shared_dict")]
-            MinarrowError::DictionaryError(source) => {
-                write!(f, "Dictionary error: {}", source)
+            MinarrowError::DictionaryOverflow => {
+                write!(
+                    f,
+                    "Categorical dictionary overflow: new value would exceed the index type's cardinality"
+                )
             }
         }
     }

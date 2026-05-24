@@ -47,7 +47,7 @@ use crate::SuperArrayV;
 use crate::enums::{error::MinarrowError, shape_dim::ShapeDim};
 use crate::ffi::arrow_dtype::ArrowType;
 #[cfg(feature = "shared_dict")]
-use crate::structs::dictionary::CategoryDispatch;
+use crate::structs::dictionary::CategoryManagerT;
 #[cfg(feature = "size")]
 use crate::traits::byte_size::ByteSize;
 use crate::traits::consolidate::Consolidate;
@@ -114,9 +114,9 @@ pub struct SuperArray {
     /// `shared_dict` is enabled. Owns the dictionary that every chunk's
     /// `Dictionary::Shared` snapshot points at. New values are added by
     /// calling `intern` on the typed manager reached via
-    /// `category_dispatch()`; this is safe to call from multiple threads.
+    /// `category_manager()`; this is safe to call from multiple threads.
     #[cfg(feature = "shared_dict")]
-    pub(crate) category_manager: Option<CategoryDispatch>,
+    pub(crate) category_manager: Option<CategoryManagerT>,
 }
 
 impl PartialEq for SuperArray {
@@ -496,7 +496,10 @@ impl SuperArray {
         #[cfg_attr(not(feature = "shared_dict"), allow(unused_mut))]
         let mut chunk = chunk;
         #[cfg(feature = "shared_dict")]
-        self.absorb_one(&mut chunk);
+        CategoryManagerT::add_remap_cats(
+            &mut self.category_manager,
+            std::iter::once(&mut chunk),
+        );
         self.chunks.push(chunk);
     }
 
@@ -520,7 +523,10 @@ impl SuperArray {
         #[cfg_attr(not(feature = "shared_dict"), allow(unused_mut))]
         let mut chunk = chunk;
         #[cfg(feature = "shared_dict")]
-        self.absorb_one(&mut chunk);
+        CategoryManagerT::add_remap_cats(
+            &mut self.category_manager,
+            std::iter::once(&mut chunk),
+        );
         self.chunks.push(chunk);
         if let Some(ref mut nc) = self.null_counts {
             nc.push(null_count);
@@ -559,7 +565,10 @@ impl SuperArray {
         #[cfg_attr(not(feature = "shared_dict"), allow(unused_mut))]
         let mut array = chunk.array;
         #[cfg(feature = "shared_dict")]
-        self.absorb_one(&mut array);
+        CategoryManagerT::add_remap_cats(
+            &mut self.category_manager,
+            std::iter::once(&mut array),
+        );
         self.chunks.push(array);
         if let Some(ref mut nc) = self.null_counts {
             nc.push(chunk.null_count);
@@ -959,31 +968,17 @@ impl SuperArray {
         &self.chunks
     }
 
-    /// Borrow the `CategoryDispatch` for this column, or `None` if the
-    /// column is not categorical or no chunks have been pushed yet. The
-    /// caller matches on the dispatch variant to reach the width-typed
-    /// `CategoryManager` and call `intern` / `snapshot` on it.
+    /// Borrow the column's `CategoryManagerT`, or `None` if the column
+    /// is not categorical or no chunks have been pushed yet.
     ///
-    /// This is the entry point for live ingestion against a categorical
-    /// SuperArray that has already absorbed chunks: the manager extends
-    /// the shared dictionary once and every sibling chunk's snapshot
-    /// remains coherent under the append-only invariant.
+    /// This accessor is for sharing-association: two `CategoricalArray`s
+    /// whose dictionaries point at the same `Arc<DictionaryInner>` (check
+    /// via `Dictionary::shares_with`) are in the same sharing group.
+    /// New values arrive through `push(chunk)`, not through this borrow.
     #[cfg(feature = "shared_dict")]
     #[inline]
-    pub fn category_dispatch(&self) -> Option<&CategoryDispatch> {
+    pub fn category_manager(&self) -> Option<&CategoryManagerT> {
         self.category_manager.as_ref()
-    }
-
-    /// Absorb one categorical chunk into the SuperArray's per-column
-    /// dispatch. Non-categorical chunks are no-ops. All width-specific
-    /// work lives behind `CategoryDispatch::absorb` /
-    /// `CategoryDispatch::install_from`.
-    #[cfg(feature = "shared_dict")]
-    fn absorb_one(&mut self, chunk: &mut Array) {
-        match &mut self.category_manager {
-            Some(dispatch) => dispatch.absorb(chunk),
-            slot @ None => *slot = CategoryDispatch::install_from(chunk),
-        }
     }
 
     /// Rebuild `category_manager` from the current `chunks`. Used by
@@ -997,13 +992,12 @@ impl SuperArray {
         if self.chunks.is_empty() {
             return;
         }
-        let chunks = std::mem::take(&mut self.chunks);
-        let mut rebuilt: Vec<Array> = Vec::with_capacity(chunks.len());
-        for mut chunk in chunks {
-            self.absorb_one(&mut chunk);
-            rebuilt.push(chunk);
-        }
-        self.chunks = rebuilt;
+        let mut chunks = std::mem::take(&mut self.chunks);
+        CategoryManagerT::add_remap_cats(
+            &mut self.category_manager,
+            chunks.iter_mut(),
+        );
+        self.chunks = chunks;
     }
 }
 
@@ -1801,7 +1795,7 @@ mod tests {
         any(not(feature = "default_categorical_8"), feature = "extended_categorical")
     ))]
     #[test]
-    fn test_shared_dict_absorb_across_pushes() {
+    fn test_shared_dict_add_across_pushes() {
         use crate::TextArray;
         use crate::arr_cat32;
 
@@ -1837,13 +1831,13 @@ mod tests {
         assert!(d0.shares_with(&d2));
         assert_eq!(d2.values(), &["a", "b", "c"]);
 
-        // category_dispatch returns Some; interning known values is idempotent.
-        let dispatch = sa.category_dispatch().expect("dispatch present after push");
+        // category_manager returns Some; interning known values is idempotent.
+        let dispatch = sa.category_manager().expect("dispatch present after push");
         match dispatch {
-            CategoryDispatch::U32(d) => {
-                assert_eq!(d.intern("a"), Ok(0));
-                assert_eq!(d.intern("b"), Ok(1));
-                assert_eq!(d.intern("c"), Ok(2));
+            CategoryManagerT::U32(d) => {
+                assert_eq!(d.add_cat("a"), Ok(0));
+                assert_eq!(d.add_cat("b"), Ok(1));
+                assert_eq!(d.add_cat("c"), Ok(2));
             }
             _ => panic!("expected U32 dispatch"),
         }

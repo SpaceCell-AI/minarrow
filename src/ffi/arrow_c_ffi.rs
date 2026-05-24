@@ -450,7 +450,7 @@ pub fn export_to_c(array: Arc<Array>, schema: Schema) -> (*mut ArrowArray, *mut 
             &array,
             schema,
             cat.data.len() as i64,
-            cat.values(),
+            cat.unique_values(),
             32,
         ),
         #[cfg(feature = "default_categorical_8")]
@@ -458,7 +458,7 @@ pub fn export_to_c(array: Arc<Array>, schema: Schema) -> (*mut ArrowArray, *mut 
             &array,
             schema,
             cat.data.len() as i64,
-            cat.values(),
+            cat.unique_values(),
             8,
         ),
         #[cfg(feature = "extended_categorical")]
@@ -466,7 +466,7 @@ pub fn export_to_c(array: Arc<Array>, schema: Schema) -> (*mut ArrowArray, *mut 
             &array,
             schema,
             cat.data.len() as i64,
-            cat.values(),
+            cat.unique_values(),
             16,
         ),
         #[cfg(feature = "extended_categorical")]
@@ -474,7 +474,7 @@ pub fn export_to_c(array: Arc<Array>, schema: Schema) -> (*mut ArrowArray, *mut 
             &array,
             schema,
             cat.data.len() as i64,
-            cat.values(),
+            cat.unique_values(),
             64,
         ),
 

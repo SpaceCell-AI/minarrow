@@ -564,7 +564,7 @@ macro_rules! cat_to_string {
 
                 for &code in &src.data {
                     let idx = code.to_usize();
-                    let s = &src.values()[idx];
+                    let s = &src.unique_values()[idx];
                     let bytes = s.as_bytes();
                     data.extend_from_slice(bytes);
 
@@ -657,7 +657,7 @@ macro_rules! cat_to_cat_widen {
         impl From<&CategoricalArray<$src>> for CategoricalArray<$dst> {
             fn from(src: &CategoricalArray<$src>) -> Self {
                 let data = src.data.iter().map(|&x| x as $dst).collect();
-                let values: Vec<String> = src.values().to_vec();
+                let values: Vec<String> = src.unique_values().to_vec();
                 CategoricalArray {
                     data,
                     #[cfg(not(feature = "shared_dict"))]
@@ -684,7 +684,7 @@ macro_rules! cat_to_cat_narrow {
                         target: stringify!($dst),
                     })?);
                 }
-                let values: Vec<String> = src.values().to_vec();
+                let values: Vec<String> = src.unique_values().to_vec();
                 Ok(CategoricalArray {
                     data: data.into(),
                     #[cfg(not(feature = "shared_dict"))]

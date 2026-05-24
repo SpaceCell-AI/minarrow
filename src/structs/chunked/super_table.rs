@@ -51,7 +51,7 @@ use std::sync::Arc;
 use crate::enums::{error::MinarrowError, shape_dim::ShapeDim};
 use crate::structs::chunked::super_array::RechunkStrategy;
 #[cfg(feature = "shared_dict")]
-use crate::structs::dictionary::CategoryDispatch;
+use crate::structs::dictionary::CategoryManagerT;
 use crate::structs::field::Field;
 use crate::structs::field_array::FieldArray;
 use crate::structs::table::Table;
@@ -98,15 +98,11 @@ pub struct SuperTable {
     /// calling the manager's `intern` method, which is safe to call from
     /// multiple threads at once. Available with the `shared_dict` feature.
     #[cfg(feature = "shared_dict")]
-    pub(crate) category_managers: Vec<Option<CategoryDispatch>>,
+    pub(crate) category_managers: Vec<Option<CategoryManagerT>>,
 }
 
 impl PartialEq for SuperTable {
-    /// Equality compares the table data: batches, schema, row count, name.
-    /// The `category_managers` are not compared because they are derived
-    /// from `batches`: every Shared snapshot in `batches` already reflects
-    /// the manager state. Two SuperTables built from the same data through
-    /// different code paths should compare equal.
+    /// Equality compares the table elements minus the category manager.
     fn eq(&self, other: &Self) -> bool {
         self.batches == other.batches
             && self.schema == other.schema
@@ -173,20 +169,13 @@ impl SuperTable {
         st
     }
 
-    /// Append a new Table batch.
+    /// Append a new Table batch. Panics on schema mismatch.
     ///
-    /// Panics on schema mismatch.
-    ///
-    /// For categorical columns, the SuperTable's `CategoryManager` for that
-    /// column owns the dictionary. On push:
-    /// - If this is the first batch, a `CategoryManager` is built from the
-    ///   batch's own dictionary.
-    /// - For subsequent batches, the incoming values are interned into the
-    ///   existing manager, the batch's data buffer is remapped to the
-    ///   resulting codes, and the batch's dictionary is set to a `Shared`
-    ///   snapshot of the manager.
-    /// This work is paid once at push, and any concurrent reads or writes
-    /// against the manager from elsewhere are still safe.
+    /// When the `shared_dict` feature is on, each categorical column is
+    /// routed through this SuperTable's `CategoryManagerT` for that
+    /// column. The first batch seeds the manager from its own dictionary;
+    /// subsequent batches merge their values into the existing manager and
+    /// rebind their dictionaries to the resulting shared snapshot.
     pub fn push(&mut self, batch: Arc<Table>) {
         if self.batches.is_empty() {
             self.schema = batch.cols.iter().map(|fa| fa.field.clone()).collect();
@@ -209,33 +198,28 @@ impl SuperTable {
         #[cfg_attr(not(feature = "shared_dict"), allow(unused_mut))]
         let mut batch = batch;
         #[cfg(feature = "shared_dict")]
-        self.absorb_dict_categories(&mut batch);
+        self.add_dict_categories(&mut batch);
 
         self.n_rows += batch.n_rows;
         self.batches.push(batch);
     }
 
-    /// Borrow the `CategoryDispatch` for the column at `col_idx`, or
-    /// `None` if the column is not categorical (or `col_idx` is out of
-    /// bounds). The caller matches on the dispatch variant to reach the
-    /// width-typed `CategoryManager` and call `intern` / `snapshot` on it.
+    /// Borrow the column's `CategoryManagerT`, or `None` if the column
+    /// is not categorical or `col_idx` is out of bounds.
     ///
-    /// This is the entry point for live ingestion against a categorical
-    /// that has already been absorbed into the SuperTable: the manager
-    /// extends the shared dictionary once and every sibling batch's
-    /// snapshot remains coherent under the append-only invariant.
+    /// This accessor is for sharing-association: two `CategoricalArray`s
+    /// whose dictionaries point at the same `Arc<DictionaryInner>` (check
+    /// via `Dictionary::shares_with`) are in the same sharing group.
+    /// New values arrive through `push(batch)`, not through this borrow.
     #[cfg(feature = "shared_dict")]
     #[inline]
-    pub fn category_dispatch(&self, col_idx: usize) -> Option<&CategoryDispatch> {
+    pub fn category_manager(&self, col_idx: usize) -> Option<&CategoryManagerT> {
         self.category_managers.get(col_idx)?.as_ref()
     }
 
-    /// Rebuild `category_managers` from the current `batches`. Used by
-    /// constructors that build a `SuperTable` directly from a vector of
-    /// `Arc<Table>` and need to set up the managers afterwards. The first
-    /// batch's dictionary for each categorical column is taken as the
-    /// starting state; subsequent batches' dictionaries are folded in by
-    /// the same logic as `push`.
+    /// Rebuild every column's category manager from the current batches.
+    /// The first batch's dictionary seeds each manager; subsequent batches
+    /// are merged in by the same logic as `push`.
     #[cfg(feature = "shared_dict")]
     pub(crate) fn rebuild_category_managers(&mut self) {
         if self.batches.is_empty() {
@@ -249,20 +233,26 @@ impl SuperTable {
         let mut rebuilt: Vec<Arc<Table>> = Vec::with_capacity(batches.len());
         for batch in batches {
             let mut batch = batch;
-            self.absorb_dict_categories(&mut batch);
+            self.add_dict_categories(&mut batch);
             rebuilt.push(batch);
         }
         self.batches = rebuilt;
     }
 
-    /// Intern incoming's categorical columns into this SuperTable's
-    /// managers, remap codes if needed, and set the batch's dictionaries
-    /// to `Shared` snapshots of the managers.
+    /// Route each categorical column in the incoming batch through this
+    /// SuperTable's column manager: merge codes, remap if shifted, and
+    /// rebind the batch's dictionary to the shared snapshot.
     #[cfg(feature = "shared_dict")]
-    fn absorb_dict_categories(&mut self, incoming: &mut Arc<Table>) {
-        let n_cols = self.schema.len();
-        for col_idx in 0..n_cols {
-            absorb_one_column(self, col_idx, incoming);
+    fn add_dict_categories(&mut self, incoming: &mut Arc<Table>) {
+        let table = Arc::make_mut(incoming);
+        if self.category_managers.len() < table.cols.len() {
+            self.category_managers.resize_with(table.cols.len(), || None);
+        }
+        for (col_idx, fa) in table.cols.iter_mut().enumerate() {
+            CategoryManagerT::add_remap_cats(
+                &mut self.category_managers[col_idx],
+                std::iter::once(&mut fa.array),
+            );
         }
     }
 
@@ -1209,21 +1199,6 @@ impl From<SuperTableV> for SuperTable {
             return SuperTable::new("".to_string());
         }
         SuperTable::from_views(&super_table_v.slices, "SuperTable".to_string())
-    }
-}
-
-/// Absorb one column from `incoming` into the SuperTable's per-column
-/// dispatch. Non-categorical columns are skipped. All width-specific work
-/// lives behind `CategoryDispatch::absorb` / `CategoryDispatch::install_from`.
-#[cfg(feature = "shared_dict")]
-fn absorb_one_column(table: &mut SuperTable, col_idx: usize, incoming: &mut Arc<Table>) {
-    if table.category_managers.len() <= col_idx {
-        table.category_managers.resize_with(col_idx + 1, || None);
-    }
-    let array = &mut Arc::make_mut(incoming).cols[col_idx].array;
-    match &mut table.category_managers[col_idx] {
-        Some(dispatch) => dispatch.absorb(array),
-        slot @ None => *slot = CategoryDispatch::install_from(array),
     }
 }
 

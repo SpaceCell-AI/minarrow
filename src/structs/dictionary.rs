@@ -169,10 +169,10 @@ impl<T: Integer> Default for ShardedIndex<T> {
 }
 
 impl<T: Integer> ShardedIndex<T> {
-    /// Shard index for `s`. Used by the non-ultimate paths only - under
-    /// `fast_dict` the intern / lookup sites compute the
-    /// hash inline (so the same `u64` serves both shard selection and
-    /// the `raw_entry_mut().from_hash(...)` probe) and don't call this.
+    /// Shard index for `s`. Used by the paths that don't have the
+    /// `fast_dict` feature; with `fast_dict`, `intern` and `lookup`
+    /// compute the hash inline so the same `u64` serves both shard
+    /// selection and the `raw_entry_mut().from_hash(...)` probe.
     #[cfg(not(feature = "fast_dict"))]
     #[inline]
     #[allow(clippy::unused_self)]
@@ -360,7 +360,7 @@ impl<T: Integer> Dictionary<T> {
     /// each other. Returns `Err(DictionaryError::Overflow)` if the new
     /// cardinality would exceed the capacity of `T`, leaving the
     /// dictionary unchanged and no slot reserved.
-    pub fn intern(&self, value: &str) -> Result<T, DictionaryError> {
+    pub fn add_cat(&self, value: &str) -> Result<T, DictionaryError> {
         #[cfg(feature = "fast_dict")]
         {
             use hashbrown::hash_map::RawEntryMut;
@@ -399,8 +399,8 @@ impl<T: Integer> Dictionary<T> {
             if let Some(&code) = g.get(value) {
                 return Ok(code);
             }
-            // Non-ultimate path stores the string twice (once in the
-            // value array, once as the hashmap key) - the price of the
+            // Without `fast_dict` the string is stored twice, in the
+            // value array and as the hashmap key - the price of the
             // simpler stable-std design without `raw_entry`.
             let idx = self
                 .inner
@@ -418,12 +418,12 @@ impl<T: Integer> Dictionary<T> {
     /// to the resulting codes if any code shifted, and rebinds `cat`'s
     /// dictionary to a clone of `self` so the chunk joins the sharing
     /// group.
-    pub fn absorb(&self, cat: &mut crate::CategoricalArray<T>) {
+    pub fn add_remap_cat(&self, cat: &mut crate::CategoricalArray<T>) {
         let incoming = &cat.dictionary.inner.values;
         let mut shifted = false;
         let mut remap: Vec<T> = Vec::with_capacity(incoming.count());
         for (incoming_code, s) in incoming.iter() {
-            let Ok(new_code) = self.intern(s) else { return };
+            let Ok(new_code) = self.add_cat(s) else { return };
             if new_code.to_usize() != incoming_code {
                 shifted = true;
             }
@@ -574,16 +574,16 @@ fn max_cap<T: Integer>() -> usize {
 }
 
 // =============================================================================
-// CategoryDispatch - width-erased holder used by parent containers.
+// CategoryManagerT - width-erased holder used by parent containers.
 // =============================================================================
 
 /// Width-erased `Dictionary` so a parent container (`SuperTable`,
 /// `SuperArray`) can hold one entry per categorical column without being
 /// generic over each column's width. Each variant carries the column's
-/// typed `Dictionary`; cloning a `CategoryDispatch` is an Arc bump on the
+/// typed `Dictionary`; cloning a `CategoryManagerT` is an Arc bump on the
 /// underlying inner.
 #[derive(Debug, Clone)]
-pub enum CategoryDispatch {
+pub enum CategoryManagerT {
     #[cfg(feature = "default_categorical_8")]
     U8(Dictionary<u8>),
     #[cfg(feature = "extended_categorical")]
@@ -594,11 +594,11 @@ pub enum CategoryDispatch {
     U64(Dictionary<u64>),
 }
 
-impl CategoryDispatch {
+impl CategoryManagerT {
     /// Install a fresh dispatch from a batch's categorical column by
-    /// cloning the chunk's dictionary (Arc bump). Subsequent absorbs from
-    /// other chunks intern through this dispatch's dictionary and rebind
-    /// those chunks to share the same Arc.
+    /// cloning the chunk's dictionary (Arc bump). Subsequent chunks
+    /// added through `add_remap_cat` merge their values into this
+    /// dictionary and rebind themselves to share the same Arc.
     ///
     /// Returns `None` if the array is not categorical at any enabled width.
     pub fn install_from(array: &mut crate::Array) -> Option<Self> {
@@ -607,50 +607,75 @@ impl CategoryDispatch {
             #[cfg(any(not(feature = "default_categorical_8"), feature = "extended_categorical"))]
             Array::TextArray(TextArray::Categorical32(arc)) => {
                 let cat = Arc::make_mut(arc);
-                Some(CategoryDispatch::U32(cat.dictionary.clone()))
+                Some(CategoryManagerT::U32(cat.dictionary.clone()))
             }
             #[cfg(feature = "default_categorical_8")]
             Array::TextArray(TextArray::Categorical8(arc)) => {
                 let cat = Arc::make_mut(arc);
-                Some(CategoryDispatch::U8(cat.dictionary.clone()))
+                Some(CategoryManagerT::U8(cat.dictionary.clone()))
             }
             #[cfg(feature = "extended_categorical")]
             Array::TextArray(TextArray::Categorical16(arc)) => {
                 let cat = Arc::make_mut(arc);
-                Some(CategoryDispatch::U16(cat.dictionary.clone()))
+                Some(CategoryManagerT::U16(cat.dictionary.clone()))
             }
             #[cfg(feature = "extended_categorical")]
             Array::TextArray(TextArray::Categorical64(arc)) => {
                 let cat = Arc::make_mut(arc);
-                Some(CategoryDispatch::U64(cat.dictionary.clone()))
+                Some(CategoryManagerT::U64(cat.dictionary.clone()))
             }
             _ => None,
         }
     }
 
     /// Dispatches on the dispatch variant and the array's categorical
-    /// width, calling `Dictionary::absorb` on the matching pair. Width
-    /// mismatch is a schema error upstream and is treated as a no-op here.
-    pub fn absorb(&self, array: &mut crate::Array) {
+    /// width, calling `Dictionary::add_remap_cat` on the matching pair.
+    /// Width mismatch is a schema error upstream and is treated as a
+    /// no-op here.
+    pub fn add_remap_cat(&self, array: &mut crate::Array) {
         use crate::{Array, TextArray};
         match (self, array) {
             #[cfg(any(not(feature = "default_categorical_8"), feature = "extended_categorical"))]
-            (CategoryDispatch::U32(d), Array::TextArray(TextArray::Categorical32(arc))) => {
-                d.absorb(Arc::make_mut(arc));
+            (CategoryManagerT::U32(d), Array::TextArray(TextArray::Categorical32(arc))) => {
+                d.add_remap_cat(Arc::make_mut(arc));
             }
             #[cfg(feature = "default_categorical_8")]
-            (CategoryDispatch::U8(d), Array::TextArray(TextArray::Categorical8(arc))) => {
-                d.absorb(Arc::make_mut(arc));
+            (CategoryManagerT::U8(d), Array::TextArray(TextArray::Categorical8(arc))) => {
+                d.add_remap_cat(Arc::make_mut(arc));
             }
             #[cfg(feature = "extended_categorical")]
-            (CategoryDispatch::U16(d), Array::TextArray(TextArray::Categorical16(arc))) => {
-                d.absorb(Arc::make_mut(arc));
+            (CategoryManagerT::U16(d), Array::TextArray(TextArray::Categorical16(arc))) => {
+                d.add_remap_cat(Arc::make_mut(arc));
             }
             #[cfg(feature = "extended_categorical")]
-            (CategoryDispatch::U64(d), Array::TextArray(TextArray::Categorical64(arc))) => {
-                d.absorb(Arc::make_mut(arc));
+            (CategoryManagerT::U64(d), Array::TextArray(TextArray::Categorical64(arc))) => {
+                d.add_remap_cat(Arc::make_mut(arc));
             }
             _ => {}
+        }
+    }
+
+    /// Install or merge a sequence of categorical chunks into `slot`.
+    ///
+    /// If `slot` is `None`, the first categorical chunk seeds it via
+    /// `install_from`. Subsequent chunks are merged through
+    /// `add_remap_cat`, which interns each chunk's dictionary into the
+    /// shared store and remaps codes if the union shifted them.
+    /// Non-categorical chunks are skipped.
+    ///
+    /// This is the entry point for parent containers (`SuperTable`,
+    /// `SuperArray`) that hold a per-column manager slot. The per-chunk
+    /// install / merge dichotomy lives here so the parent does not
+    /// need to express it.
+    pub fn add_remap_cats<'a, I>(slot: &mut Option<Self>, chunks: I)
+    where
+        I: IntoIterator<Item = &'a mut crate::Array>,
+    {
+        for chunk in chunks {
+            match slot {
+                Some(m) => m.add_remap_cat(chunk),
+                None => *slot = Self::install_from(chunk),
+            }
         }
     }
 
@@ -658,13 +683,13 @@ impl CategoryDispatch {
     pub fn len(&self) -> usize {
         match self {
             #[cfg(feature = "default_categorical_8")]
-            CategoryDispatch::U8(d) => d.len(),
+            CategoryManagerT::U8(d) => d.len(),
             #[cfg(feature = "extended_categorical")]
-            CategoryDispatch::U16(d) => d.len(),
+            CategoryManagerT::U16(d) => d.len(),
             #[cfg(any(not(feature = "default_categorical_8"), feature = "extended_categorical"))]
-            CategoryDispatch::U32(d) => d.len(),
+            CategoryManagerT::U32(d) => d.len(),
             #[cfg(feature = "extended_categorical")]
-            CategoryDispatch::U64(d) => d.len(),
+            CategoryManagerT::U64(d) => d.len(),
         }
     }
 }
@@ -684,10 +709,10 @@ mod tests {
     #[test]
     fn intern_assigns_dense_sequential_codes() {
         let d: Dictionary<u32> = Dictionary::new();
-        assert_eq!(d.intern("a"), Ok(0));
-        assert_eq!(d.intern("b"), Ok(1));
-        assert_eq!(d.intern("c"), Ok(2));
-        assert_eq!(d.intern("a"), Ok(0));
+        assert_eq!(d.add_cat("a"), Ok(0));
+        assert_eq!(d.add_cat("b"), Ok(1));
+        assert_eq!(d.add_cat("c"), Ok(2));
+        assert_eq!(d.add_cat("a"), Ok(0));
         assert_eq!(d.len(), 3);
         let values: Vec<&str> = d.values().iter().map(|s| s.as_str()).collect();
         assert_eq!(values, vec!["a", "b", "c"]);
@@ -699,7 +724,7 @@ mod tests {
         let cloned = d.clone();
         assert!(d.shares_with(&cloned));
         // Update through one is visible through the other.
-        assert_eq!(d.intern("a"), Ok(0));
+        assert_eq!(d.add_cat("a"), Ok(0));
         let values: Vec<&str> = cloned.values().iter().map(|s| s.as_str()).collect();
         assert_eq!(values, vec!["a"]);
     }
@@ -707,13 +732,13 @@ mod tests {
     #[test]
     fn detach_breaks_sharing() {
         let a: Dictionary<u32> = Dictionary::new();
-        let _ = a.intern("x").unwrap();
+        let _ = a.add_cat("x").unwrap();
         let mut b = a.clone();
         b.detach_to_owned();
         assert_eq!(a.values().get(0).map(|s| s.as_str()), Some("x"));
         assert_eq!(b.values().get(0).map(|s| s.as_str()), Some("x"));
         assert!(!a.shares_with(&b));
-        let _ = b.intern("y").unwrap();
+        let _ = b.add_cat("y").unwrap();
         assert_eq!(a.len(), 1);
         assert_eq!(b.len(), 2);
     }
@@ -734,9 +759,9 @@ mod tests {
     fn intern_returns_overflow_at_u8_cap() {
         let d: Dictionary<u8> = Dictionary::new();
         for i in 0..256u32 {
-            d.intern(&format!("v{i}")).unwrap();
+            d.add_cat(&format!("v{i}")).unwrap();
         }
-        assert_eq!(d.intern("overflow"), Err(DictionaryError::Overflow));
+        assert_eq!(d.add_cat("overflow"), Err(DictionaryError::Overflow));
         assert_eq!(d.len(), 256);
     }
 
@@ -757,7 +782,7 @@ mod tests {
                 let mut overflows = 0u32;
                 for i in 0..100 {
                     let s = format!("t{t}_v{i}");
-                    match d.intern(&s) {
+                    match d.add_cat(&s) {
                         Ok(_) => successes += 1,
                         Err(DictionaryError::Overflow) => overflows += 1,
                     }
@@ -789,7 +814,7 @@ mod tests {
             let d = Arc::clone(&d);
             handles.push(thread::spawn(move || {
                 for i in 0..500 {
-                    let _ = d.intern(&format!("t{t}_v{i}")).unwrap();
+                    let _ = d.add_cat(&format!("t{t}_v{i}")).unwrap();
                 }
             }));
         }

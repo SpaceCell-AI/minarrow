@@ -131,7 +131,7 @@ fn new_array_for_thread(
     shared: &Dictionary<u32>,
 ) -> CategoricalArray<u32> {
     use vec64::Vec64;
-    CategoricalArray::<u32>::with_dictionary(
+    CategoricalArray::<u32>::new_via_dict(
         Vec64::<u32>::with_capacity(capacity),
         shared.clone(),
         None,
@@ -245,7 +245,7 @@ fn run_stress(threads: usize, iters: usize) {
     // Dictionary cardinality reporting.
     //
     // Under `shared_dict`, every thread's categorical points at the
-    // same shared dictionary, so `cats[0].values().len()` is the true
+    // same shared dictionary, so `cats[0].unique_values().len()` is the true
     // unique cardinality across all threads. Summing per-thread would
     // count each entry N times.
     //
@@ -253,9 +253,9 @@ fn run_stress(threads: usize, iters: usize) {
     // dictionary. Sum the per-thread sizes (legitimate because they
     // are separate dicts; per-thread = total / threads).
     #[cfg(feature = "shared_dict")]
-    let unique_in_dict = cats[0].values().len();
+    let unique_in_dict = cats[0].unique_values().len();
     #[cfg(not(feature = "shared_dict"))]
-    let unique_in_dict: usize = cats.iter().map(|c| c.values().len()).sum();
+    let unique_in_dict: usize = cats.iter().map(|c| c.unique_values().len()).sum();
 
     println!();
     println!("=== Categorical stress [{}] ===", MODE);
@@ -299,7 +299,7 @@ fn run_stress(threads: usize, iters: usize) {
     {
         // Every thread's categorical shares the same dictionary; pick
         // any one and inspect it.
-        let dict_values = cats[0].values();
+        let dict_values = cats[0].unique_values();
 
         // (1) No duplicate strings.
         let unique: HashSet<&str> = dict_values.iter().map(|s| s.as_str()).collect();

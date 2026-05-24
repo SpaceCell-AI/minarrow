@@ -129,7 +129,7 @@ impl<T: crate::traits::type_unions::Integer> ByteSize for CategoricalArray<T> {
         // Approximate the dictionary container at
         // `values_count * size_of::<String>()`; matches the prior
         // behaviour against `Vec64::est_bytes` for an appended-once vector.
-        let unique_values_bytes = self.values().len() * std::mem::size_of::<String>();
+        let unique_values_bytes = self.unique_values().len() * std::mem::size_of::<String>();
         let mask_bytes = self.null_mask.as_ref().map_or(0, |m| m.est_bytes());
         data_bytes + unique_values_bytes + mask_bytes
     }
