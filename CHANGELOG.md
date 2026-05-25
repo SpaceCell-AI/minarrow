@@ -5,7 +5,51 @@ All notable changes to **minarrow** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## 0.12.0
+
+**IMPORTANT**: This change includes important Null Mask initialisation corrections.
+These alter (correct) the behaviour of initialisation code paths for `with_capacity`
+typed array constructors, and Bitmask `resize`. It is recommended that all users upgrade.
+
+### Added
+- Shared categorical dictionaries behind the new `shared_dict` feature.
+  With the feature on, categorical arrays in the same group share one
+  dictionary, so codes mean the same string across batches and group-by /
+  joins / filters can work on codes directly (#100).
+- `fast_dict` feature for faster dictionary interning under heavy
+  multi-thread workloads (#100).
+- `Consolidate` is now implemented on each typed array via the AVT view
+  tuples in `aliases.rs`. The top-level `Vec<ArrayVT<'a>>::consolidate`
+  matches on the first chunk's variant and routes to the typed impl,
+  replacing the previous per-variant macros (#100).
+- `Bitmask::set_range(start, end, value)` for writing a contiguous run
+  of bits in one call (#99).
+- `Default` for `Scalar` returning `Scalar::Null` (#101).
+- `Vec<Value>` terminal coercion into `Array` / `Table` / `SuperTable`
+  via the corresponding `TryFrom` impls (#101).
+
+### Changed
+- Renamed `CategoricalArray::values()` to `unique_values()`.
+- Typed-array `with_capacity(N, true)` constructors now build the null
+  mask as all-valid, so a freshly reserved array reports
+  `null_count() == 0` rather than `N` (#99).
+- `Bitmask::resize` correctly handles extension when `set = true` across
+  a partial old-byte boundary (#99).
+- `SuperTable::from_batches` validates schema consistency across all
+  batches up front, surfacing mismatches as an error rather than
+  panicking on a downstream read (#101).
+- `SuperArrayV::consolidate` now collects view tuples and routes through
+  the new typed `Consolidate` impls.
+
+### Fixed
+- `BooleanArray` consolidate path with mixed-null chunks: result mask
+  was pre-sized to `total_len` and then extended in place, ending up at
+  `2 * total_len` and tripping the validator in `BooleanArray::new`.
+  Result mask is now overwritten in place for chunks that carry a null mask (#100).
+- `push_nulls` on typed arrays now correctly marks the new positions as null via `Bitmask::set_range`.
+- `MinarrowError::DictionaryOverflow` is always present. The variant
+  was previously cfg-gated, which forced downstream matches to also
+  feature-gate the arm (#100).
 
 ## [0.11.0] - 2026-05-15
 
