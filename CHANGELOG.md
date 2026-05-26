@@ -7,7 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## 0.12.1
+
 ### Added
+- Ergonomic constructor macros for `Table` `tbl!`, `Matrix` `mat!`, and `SuperTable` `st!`.
+- Add null mask support for existing `Array` `arr!` and `FieldArray` `fa!` constructors. 
 - Zero-Copy FFI for the Minarrow `View` types.
 
 ## 0.12.0

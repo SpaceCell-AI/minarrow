@@ -1671,7 +1671,7 @@ dependencies = [
 
 [[package]]
 name = "minarrow"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "ahash",
  "arrow",

@@ -52,7 +52,7 @@ dependencies = [
 
 [[package]]
 name = "minarrow"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "libc",
  "log",
@@ -62,7 +62,7 @@ dependencies = [
 
 [[package]]
 name = "minarrow-pyo3"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "minarrow",
  "pyo3",
