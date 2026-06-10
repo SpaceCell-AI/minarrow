@@ -74,6 +74,7 @@ use crate::{
 use ::vec64::{Vec64, Vec64Alloc};
 
 pub mod datetime_ops;
+pub mod parse;
 pub mod tz;
 
 /// Julian Day Number corresponding to the Unix epoch (1970-01-01 00:00:00 UTC).

@@ -288,6 +288,8 @@ pub use structs::variants::boolean::BooleanArray;
 pub use structs::variants::categorical::CategoricalArray;
 #[cfg(feature = "datetime")]
 pub use structs::variants::datetime::DatetimeArray;
+#[cfg(feature = "datetime")]
+pub use structs::variants::datetime::parse::{parse_iso8601_utc, parse_iso8601_utc_ns};
 pub use structs::variants::float::FloatArray;
 pub use structs::variants::integer::IntegerArray;
 pub use structs::variants::string::StringArray;
