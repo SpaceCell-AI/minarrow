@@ -232,7 +232,7 @@ where
     let raw = unsafe { mask.word_unchecked(word_idx) } >> bit_shift;
 
     // If the chunk straddles a word boundary, pull in bits from the next word
-    let raw = if bit_shift > 0 && word_idx + 1 < (mask.len + 63) / 64 {
+    let raw = if bit_shift > 0 && word_idx + 1 < (mask.len() + 63) / 64 {
         raw | (unsafe { mask.word_unchecked(word_idx + 1) } << (64 - bit_shift))
     } else {
         raw

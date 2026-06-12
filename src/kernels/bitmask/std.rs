@@ -108,7 +108,6 @@ pub fn bitmask_binop_std(lhs: BitmaskVT<'_>, rhs: BitmaskVT<'_>, op: LogicalOper
             };
         }
     }
-    out.len = len;
     clear_trailing_bits(&mut out);
     out
 }
@@ -146,7 +145,6 @@ pub fn bitmask_unop_std(src: BitmaskVT<'_>, op: UnaryOperator) -> Bitmask {
             };
         }
     }
-    out.len = len;
     clear_trailing_bits(&mut out);
     out
 }
@@ -221,7 +219,7 @@ pub fn in_mask(lhs: BitmaskVT<'_>, rhs: BitmaskVT<'_>) -> Bitmask {
 #[inline]
 pub fn not_in_mask(lhs: BitmaskVT<'_>, rhs: BitmaskVT<'_>) -> Bitmask {
     let mask = in_mask(lhs, rhs);
-    not_mask((&mask, 0, mask.len))
+    not_mask((&mask, 0, mask.len()))
 }
 
 /// Element-wise equality: output bit is 1 if bits at position are equal.
@@ -268,7 +266,7 @@ pub fn eq_mask(a: BitmaskVT<'_>, b: BitmaskVT<'_>) -> Bitmask {
 #[inline]
 pub fn ne_mask(a: BitmaskVT<'_>, b: BitmaskVT<'_>) -> Bitmask {
     let eq = eq_mask(a, b);
-    not_mask((&eq, 0, eq.len))
+    not_mask((&eq, 0, eq.len()))
 }
 
 /// Returns true if all bits are equal across two slices.
@@ -379,7 +377,7 @@ pub fn popcount_mask(m: BitmaskVT<'_>) -> usize {
 /// Are *all* logical bits `1`?
 #[inline]
 pub fn all_true_mask(mask: &Bitmask) -> bool {
-    let n_bits = mask.len;
+    let n_bits = mask.len();
     if n_bits == 0 {
         return true;
     }
@@ -419,7 +417,7 @@ pub fn all_true_mask(mask: &Bitmask) -> bool {
 /// Are *all* logical bits `0`?
 #[inline]
 pub fn all_false_mask(mask: &Bitmask) -> bool {
-    let n_bits = mask.len;
+    let n_bits = mask.len();
     if n_bits == 0 {
         return true;
     }
@@ -475,7 +473,7 @@ mod tests {
     fn test_and_masks() {
         let a = bm(&[true, false, true, true, false, false, true, true]);
         let b = bm(&[false, false, true, false, true, false, true, false]);
-        let out = and_masks((&a, 0, a.len), (&b, 0, b.len()));
+        let out = and_masks((&a, 0, a.len()), (&b, 0, b.len()));
         let expected = bm(&[false, false, true, false, false, false, true, false]);
         for i in 0..8 {
             assert_eq!(out.get(i), expected.get(i), "Mismatch at bit {}", i);
@@ -486,7 +484,7 @@ mod tests {
     fn test_or_masks() {
         let a = bm(&[true, false, true, true]);
         let b = bm(&[false, false, true, false]);
-        let out = or_masks((&a, 0, a.len), (&b, 0, b.len()));
+        let out = or_masks((&a, 0, a.len()), (&b, 0, b.len()));
         let expected = bm(&[true, false, true, true]);
         for i in 0..4 {
             assert_eq!(out.get(i), expected.get(i));
@@ -497,7 +495,7 @@ mod tests {
     fn test_xor_masks() {
         let a = bm(&[true, false, true, false]);
         let b = bm(&[false, true, true, false]);
-        let out = xor_masks((&a, 0, a.len), (&b, 0, b.len()));
+        let out = xor_masks((&a, 0, a.len()), (&b, 0, b.len()));
         let expected = bm(&[true, true, false, false]);
         for i in 0..4 {
             assert_eq!(out.get(i), expected.get(i));
@@ -507,7 +505,7 @@ mod tests {
     #[test]
     fn test_not_mask() {
         let a = bm(&[true, false, true, false]);
-        let out = not_mask((&a, 0, a.len));
+        let out = not_mask((&a, 0, a.len()));
         let expected = bm(&[false, true, false, true]);
         for i in 0..4 {
             assert_eq!(out.get(i), expected.get(i));
@@ -518,8 +516,8 @@ mod tests {
     fn test_in_mask_all() {
         let a = bm(&[true, false, true]);
         let b = bm(&[true, false, true]); // has both true/false
-        let out = in_mask((&a, 0, a.len), (&b, 0, b.len()));
-        for i in 0..a.len {
+        let out = in_mask((&a, 0, a.len()), (&b, 0, b.len()));
+        for i in 0..a.len() {
             assert!(out.get(i), "in_mask (all true/false in rhs) bit {}", i);
         }
     }
@@ -528,7 +526,7 @@ mod tests {
     fn test_in_mask_true_only() {
         let a = bm(&[true, false, true]);
         let b = bm(&[true, true, true]);
-        let out = in_mask((&a, 0, a.len), (&b, 0, b.len()));
+        let out = in_mask((&a, 0, a.len()), (&b, 0, b.len()));
         // Only output bits set where a is true
         assert!(out.get(0));
         assert!(!out.get(1));
@@ -539,7 +537,7 @@ mod tests {
     fn test_in_mask_false_only() {
         let a = bm(&[true, false, true]);
         let b = bm(&[false, false, false]);
-        let out = in_mask((&a, 0, a.len), (&b, 0, b.len()));
+        let out = in_mask((&a, 0, a.len()), (&b, 0, b.len()));
         // Only output bits set where a is false
         assert!(!out.get(0));
         assert!(out.get(1));
@@ -550,9 +548,9 @@ mod tests {
     fn test_not_in_mask() {
         let a = bm(&[true, false]);
         let b = bm(&[true, false]);
-        let out = not_in_mask((&a, 0, a.len), (&b, 0, b.len()));
+        let out = not_in_mask((&a, 0, a.len()), (&b, 0, b.len()));
         // Both 'in', so not_in_mask should be all false.
-        for i in 0..a.len {
+        for i in 0..a.len() {
             assert!(!out.get(i));
         }
     }
@@ -561,9 +559,9 @@ mod tests {
     fn test_eq_mask() {
         let a = bm(&[true, false, true]);
         let b = bm(&[true, false, false]);
-        let out = eq_mask((&a, 0, a.len), (&b, 0, b.len()));
+        let out = eq_mask((&a, 0, a.len()), (&b, 0, b.len()));
         let expected = bm(&[true, true, false]);
-        for i in 0..a.len {
+        for i in 0..a.len() {
             assert_eq!(out.get(i), expected.get(i));
         }
     }
@@ -572,9 +570,9 @@ mod tests {
     fn test_ne_mask() {
         let a = bm(&[true, false, true]);
         let b = bm(&[true, true, false]);
-        let out = ne_mask((&a, 0, a.len), (&b, 0, b.len()));
+        let out = ne_mask((&a, 0, a.len()), (&b, 0, b.len()));
         let expected = bm(&[false, true, true]);
-        for i in 0..a.len {
+        for i in 0..a.len() {
             assert_eq!(out.get(i), expected.get(i));
         }
     }
@@ -583,34 +581,34 @@ mod tests {
     fn test_all_eq_mask_true() {
         let a = bm(&[true, false, true, false]);
         let b = bm(&[true, false, true, false]);
-        assert!(all_eq_mask((&a, 0, a.len), (&b, 0, b.len())));
+        assert!(all_eq_mask((&a, 0, a.len()), (&b, 0, b.len())));
     }
 
     #[test]
     fn test_all_eq_mask_false() {
         let a = bm(&[true, false, true, false]);
         let b = bm(&[false, true, false, true]);
-        assert!(!all_eq_mask((&a, 0, a.len), (&b, 0, b.len())));
+        assert!(!all_eq_mask((&a, 0, a.len()), (&b, 0, b.len())));
     }
 
     #[test]
     fn test_all_ne_mask_true() {
         let a = bm(&[true, false]);
         let b = bm(&[false, true]);
-        assert!(all_ne_mask((&a, 0, a.len), (&b, 0, b.len())));
+        assert!(all_ne_mask((&a, 0, a.len()), (&b, 0, b.len())));
     }
 
     #[test]
     fn test_all_ne_mask_false() {
         let a = bm(&[true, false]);
         let b = bm(&[true, false]);
-        assert!(!all_ne_mask((&a, 0, a.len), (&b, 0, b.len())));
+        assert!(!all_ne_mask((&a, 0, a.len()), (&b, 0, b.len())));
     }
 
     #[test]
     fn test_popcount_mask() {
         let a = bm(&[true, false, true, false, true, true]);
-        assert_eq!(popcount_mask((&a, 0, a.len)), 4);
+        assert_eq!(popcount_mask((&a, 0, a.len())), 4);
     }
 
     #[test]

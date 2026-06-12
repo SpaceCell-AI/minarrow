@@ -153,7 +153,6 @@ where
             };
         }
     }
-    out.len = len;
     clear_trailing_bits(&mut out);
     out
 }
@@ -232,7 +231,6 @@ where
             };
         }
     }
-    out.len = len;
     clear_trailing_bits(&mut out);
     out
 }
@@ -447,7 +445,7 @@ pub fn not_in_mask_simd<const LANES: usize>(lhs: BitmaskVT<'_>, rhs: BitmaskVT<'
 where
 {
     let mask = in_mask_simd::<LANES>(lhs, rhs);
-    not_mask_simd::<LANES>((&mask, 0, mask.len))
+    not_mask_simd::<LANES>((&mask, 0, mask.len()))
 }
 
 /// Produces a bitmask where each output bit is 1 iff the corresponding bits of `a` and `b` are equal.
@@ -731,10 +729,10 @@ where
 pub fn all_true_mask_simd<const LANES: usize>(mask: &Bitmask) -> bool
 where
 {
-    if mask.len == 0 {
+    let len = mask.len();
+    if len == 0 {
         return true;
     }
-    let len = mask.len;
     let bytes = mask.bits.as_ref();
     let total_bytes = (len + 7) / 8;
     let full_words = total_bytes / 8;
@@ -796,10 +794,10 @@ where
 pub fn all_false_mask_simd<const LANES: usize>(mask: &Bitmask) -> bool
 where
 {
-    if mask.len == 0 {
+    let len = mask.len();
+    if len == 0 {
         return true;
     }
-    let len = mask.len;
     let bytes = mask.bits.as_ref();
     let total_bytes = (len + 7) / 8;
     let full_words = total_bytes / 8;
@@ -931,7 +929,7 @@ mod tests {
                     m
                 }
                 fn slice(mask: &Bitmask) -> BitmaskVT<'_> {
-                    (mask, 0, mask.len)
+                    (mask, 0, mask.len())
                 }
 
                 #[test]
@@ -939,7 +937,7 @@ mod tests {
                     let a = bm(&[true, false, true, false, true, true, false, false]);
                     let b = bm(&[true, true, false, false, true, false, true, false]);
                     let c = and_masks_simd::<LANES>(slice(&a), slice(&b));
-                    for i in 0..a.len {
+                    for i in 0..a.len() {
                         assert_eq!(c.get(i), a.get(i) & b.get(i), "bit {i}");
                     }
                 }
@@ -949,7 +947,7 @@ mod tests {
                     let a = bm(&[true, false, true, false, true, true, false, false]);
                     let b = bm(&[true, true, false, false, true, false, true, false]);
                     let c = or_masks_simd::<LANES>(slice(&a), slice(&b));
-                    for i in 0..a.len {
+                    for i in 0..a.len() {
                         assert_eq!(c.get(i), a.get(i) | b.get(i), "bit {i}");
                     }
                 }
@@ -959,7 +957,7 @@ mod tests {
                     let a = bm(&[true, false, true, false, true, true, false, false]);
                     let b = bm(&[true, true, false, false, true, false, true, false]);
                     let c = xor_masks_simd::<LANES>(slice(&a), slice(&b));
-                    for i in 0..a.len {
+                    for i in 0..a.len() {
                         assert_eq!(c.get(i), a.get(i) ^ b.get(i), "bit {i}");
                     }
                 }
@@ -968,7 +966,7 @@ mod tests {
                 fn test_not_mask_simd() {
                     let a = bm(&[true, false, true, false]);
                     let c = not_mask_simd::<LANES>(slice(&a));
-                    for i in 0..a.len {
+                    for i in 0..a.len() {
                         assert_eq!(c.get(i), !a.get(i));
                     }
                 }
@@ -979,25 +977,25 @@ mod tests {
                     // RHS = [true]: only 'true' in rhs
                     let rhs_true = bm(&[true; 4]);
                     let out = in_mask_simd::<LANES>(slice(&lhs), slice(&rhs_true));
-                    for i in 0..lhs.len {
+                    for i in 0..lhs.len() {
                         assert_eq!(out.get(i), lhs.get(i), "in_mask, only true, bit {i}");
                     }
                     // RHS = [false]: only 'false' in rhs
                     let rhs_false = bm(&[false; 4]);
                     let out = in_mask_simd::<LANES>(slice(&lhs), slice(&rhs_false));
-                    for i in 0..lhs.len {
+                    for i in 0..lhs.len() {
                         assert_eq!(out.get(i), !lhs.get(i), "in_mask, only false, bit {i}");
                     }
                     // RHS = [true, false]: both present
                     let rhs_both = bm(&[true, false, true, false]);
                     let out = in_mask_simd::<LANES>(slice(&lhs), slice(&rhs_both));
-                    for i in 0..lhs.len {
+                    for i in 0..lhs.len() {
                         assert!(out.get(i), "in_mask, both true/false, bit {i}");
                     }
                     // RHS empty
                     let rhs_empty = bm(&[false; 0]);
                     let out = in_mask_simd::<LANES>((&lhs, 0, 0), (&rhs_empty, 0, 0));
-                    assert_eq!(out.len, 0);
+                    assert_eq!(out.len(), 0);
                 }
 
                 #[test]
@@ -1006,7 +1004,7 @@ mod tests {
                     let rhs = bm(&[true, false, true, false]);
                     let in_mask = in_mask_simd::<LANES>(slice(&lhs), slice(&rhs));
                     let not_in = not_in_mask_simd::<LANES>(slice(&lhs), slice(&rhs));
-                    for i in 0..lhs.len {
+                    for i in 0..lhs.len() {
                         assert_eq!(not_in.get(i), !in_mask.get(i));
                     }
                 }
@@ -1017,7 +1015,7 @@ mod tests {
                     let b = bm(&[true, false, false, true]);
                     let eq = eq_mask_simd::<LANES>(slice(&a), slice(&b));
                     let ne = ne_mask_simd::<LANES>(slice(&a), slice(&b));
-                    for i in 0..a.len {
+                    for i in 0..a.len() {
                         assert_eq!(eq.get(i), a.get(i) == b.get(i), "eq_mask bit {i}");
                         assert_eq!(ne.get(i), a.get(i) != b.get(i), "ne_mask bit {i}");
                     }

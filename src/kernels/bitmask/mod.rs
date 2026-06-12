@@ -136,13 +136,14 @@ pub fn bitmask_window_bytes_mut(mask: &mut Bitmask, offset: usize, len: usize) -
     &mut mask.bits[start..end]
 }
 
-/// Zero all slack bits ≥ `bm.len`.
+/// Zero all slack bits ≥ `bm.len()`.
 #[inline(always)]
 pub fn clear_trailing_bits(bm: &mut Bitmask) {
-    if bm.len == 0 {
+    let len = bm.len();
+    if len == 0 {
         return;
     }
-    let used = bm.len & 7;
+    let used = len & 7;
     if used != 0 {
         let last = bm.bits.last_mut().unwrap();
         *last &= (1u8 << used) - 1;

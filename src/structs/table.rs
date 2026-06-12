@@ -237,9 +237,17 @@ impl Table {
     }
 
     /// Returns the number of rows.
+    #[cfg(not(feature = "lbuffer"))]
     #[inline]
     pub fn n_rows(&self) -> usize {
         self.n_rows
+    }
+
+    /// Returns the number of rows.
+    #[cfg(feature = "lbuffer")]
+    #[inline]
+    pub fn n_rows(&self) -> usize {
+        self.cols.iter().map(|c| c.len()).min().unwrap_or(0)
     }
 
     /// Returns true if the table is empty (no columns or no rows).
@@ -318,7 +326,7 @@ impl Table {
         let idx = self.col_name_index(name)
             .ok_or_else(|| MinarrowError::IndexError(format!("column '{}' not found", name)))?;
         let ba = self.cols[idx].array.bool_ref()?;
-        Ok(BitmaskV::new(ba.data.clone(), 0, ba.len))
+        Ok(BitmaskV::new(ba.data.clone(), 0, ba.len()))
     }
 
     /// Removes a column by name.

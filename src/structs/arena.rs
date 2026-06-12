@@ -291,7 +291,7 @@ impl Arena {
             for (src, null_mask) in slices {
                 match null_mask {
                     Some(src_mask) => mask.extend_from_bitmask(src_mask),
-                    None => mask.resize(mask.len + src.len(), true),
+                    None => mask.resize(mask.len() + src.len(), true),
                 }
             }
             self.region_as_mut_slice::<u8>(mask_region.as_ref().unwrap())
@@ -374,7 +374,7 @@ impl Arena {
                 let batch_len = offsets.len() - 1;
                 match null_mask {
                     Some(src_mask) => mask.extend_from_bitmask(src_mask),
-                    None => mask.resize(mask.len + batch_len, true),
+                    None => mask.resize(mask.len() + batch_len, true),
                 }
             }
             self.region_as_mut_slice::<u8>(mask_region.as_ref().unwrap())
@@ -417,7 +417,7 @@ impl Arena {
             if let Some(ref mut mask) = mask_builder {
                 match null_mask {
                     Some(src_mask) => mask.extend_from_bitmask(src_mask),
-                    None => mask.resize(mask.len + src_data.len(), true),
+                    None => mask.resize(mask.len() + src_data.len(), true),
                 }
             }
         }
@@ -1639,7 +1639,7 @@ mod tests {
         let region = arena.push_bitmask(&mask);
         let shared = arena.freeze();
         let recovered = region.to_bitmask(&shared, 10);
-        assert_eq!(recovered.len, 10);
+        assert_eq!(recovered.len(), 10);
         for i in 0..10 {
             assert!(recovered.get(i), "Bit {} should be set", i);
         }
