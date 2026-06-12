@@ -102,6 +102,24 @@ impl TemporalArray {
         }
     }
 
+    /// Removes the rows in `[start, end)`, shifting later rows left.
+    /// A shared inner array is cloned first i.e. copy-on-write.
+    ///
+    /// # Panics
+    /// Panics if `start > end` or `end > len`.
+    pub fn delete_range(&mut self, start: usize, end: usize) {
+        match self {
+            TemporalArray::Datetime32(arr) => arr.delete_range(start, end),
+            TemporalArray::Datetime64(arr) => arr.delete_range(start, end),
+            TemporalArray::Null => {
+                assert!(
+                    start == 0 && end == 0,
+                    "TemporalArray::Null: delete_range out of bounds"
+                );
+            }
+        }
+    }
+
     /// Returns the underlying null mask, if any.
     #[inline]
     pub fn null_mask(&self) -> Option<&Bitmask> {

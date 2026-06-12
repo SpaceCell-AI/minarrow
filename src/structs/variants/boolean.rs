@@ -392,6 +392,18 @@ impl MaskedArray for BooleanArray<()> {
     type LogicalType = bool;
     type CopyType<'a> = bool where Self: 'a;
 
+    /// Removes the rows in `[start, end)`, shifting later rows left.
+    ///
+    /// # Panics
+    /// Panics if `start > end` or `end > len`.
+    fn delete_range(&mut self, start: usize, end: usize) {
+        self.data.delete_range(start, end);
+        if let Some(mask) = &mut self.null_mask {
+            mask.delete_range(start, end);
+        }
+        self.len = self.data.len();
+    }
+
     fn data(&self) -> &Bitmask {
         &self.data
     }

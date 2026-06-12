@@ -108,6 +108,33 @@ impl TextArray {
         }
     }
 
+    /// Removes the rows in `[start, end)`, shifting later rows left.
+    /// A shared inner array is cloned first i.e. copy-on-write.
+    ///
+    /// # Panics
+    /// Panics if `start > end` or `end > len`.
+    pub fn delete_range(&mut self, start: usize, end: usize) {
+        match self {
+            TextArray::String32(arr) => arr.delete_range(start, end),
+            #[cfg(feature = "large_string")]
+            TextArray::String64(arr) => arr.delete_range(start, end),
+            #[cfg(feature = "default_categorical_8")]
+            TextArray::Categorical8(arr) => arr.delete_range(start, end),
+            #[cfg(feature = "extended_categorical")]
+            TextArray::Categorical16(arr) => arr.delete_range(start, end),
+            #[cfg(any(not(feature = "default_categorical_8"), feature = "extended_categorical"))]
+            TextArray::Categorical32(arr) => arr.delete_range(start, end),
+            #[cfg(feature = "extended_categorical")]
+            TextArray::Categorical64(arr) => arr.delete_range(start, end),
+            TextArray::Null => {
+                assert!(
+                    start == 0 && end == 0,
+                    "TextArray::Null: delete_range out of bounds"
+                );
+            }
+        }
+    }
+
     /// Returns the underlying null mask, if any.
     #[inline]
     pub fn null_mask(&self) -> Option<&Bitmask> {

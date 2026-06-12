@@ -107,6 +107,63 @@ impl Bitmask {
         self.bits[last] &= mask;
     }
 
+    /// Removes the bits in `[start, end)`, shifting later bits left.
+    ///
+    /// Byte-aligned endpoints delete whole bytes in place. Other inputs
+    /// shift the surviving tail down bitwise, one byte at a time.
+    ///
+    /// # Panics
+    /// Panics if `start > end` or `end > len`.
+    pub fn delete_range(&mut self, start: usize, end: usize) {
+        assert!(start <= end, "Bitmask::delete_range: start ({start}) > end ({end})");
+        assert!(
+            end <= self.len,
+            "Bitmask::delete_range: end ({end}) > len ({})",
+            self.len
+        );
+        let span = end - start;
+        if span == 0 {
+            return;
+        }
+        let new_len = self.len - span;
+
+        if start & 7 == 0 && end & 7 == 0 {
+            // Byte-aligned endpoints: delete whole bytes in place.
+            self.bits.delete_range(start / 8, end / 8);
+        } else if end == self.len {
+            // Tail delete: nothing shifts.
+            self.bits.truncate((new_len + 7) / 8);
+        } else {
+            // Destination bit `i` takes source bit `i + span`. Writes trail
+            // reads, so the shift is safe in place. Within the byte holding
+            // `start`, the bits below `start` keep their original values.
+            let q = span / 8;
+            let sh = (span & 7) as u32;
+            let n_bytes = self.bits.len();
+            let first = start / 8;
+            let last = (new_len - 1) / 8;
+            for byte_idx in first..=last {
+                let lo = self.bits[byte_idx + q];
+                let hi = if byte_idx + q + 1 < n_bytes {
+                    self.bits[byte_idx + q + 1]
+                } else {
+                    0
+                };
+                let shifted = if sh == 0 { lo } else { (lo >> sh) | (hi << (8 - sh)) };
+                let keep = start & 7;
+                self.bits[byte_idx] = if byte_idx == first && keep != 0 {
+                    let mask = (1u8 << keep) - 1;
+                    (self.bits[byte_idx] & mask) | (shifted & !mask)
+                } else {
+                    shifted
+                };
+            }
+            self.bits.truncate((new_len + 7) / 8);
+        }
+        self.len = new_len;
+        self.mask_trailing_bits();
+    }
+
     /// Create new mask, length = `len`, all bits set if `set` else cleared.
     #[inline]
     pub fn new_set_all(len: usize, set: bool) -> Self {

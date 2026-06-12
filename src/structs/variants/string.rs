@@ -517,6 +517,35 @@ impl<T: Integer> MaskedArray for StringArray<T> {
 
     type CopyType<'a> = &'a str where Self: 'a;
 
+    /// Removes the rows in `[start, end)`, shifting later rows left.
+    ///
+    /// Deletes the corresponding bytes from the values buffer and rebases
+    /// the surviving tail offsets by the deleted byte width.
+    ///
+    /// # Panics
+    /// Panics if `start > end` or `end > len`.
+    fn delete_range(&mut self, start: usize, end: usize) {
+        let len = self.len();
+        assert!(start <= end, "StringArray::delete_range: start ({start}) > end ({end})");
+        assert!(end <= len, "StringArray::delete_range: end ({end}) > len ({len})");
+        if start == end {
+            return;
+        }
+        let byte_start = self.offsets[start].to_usize();
+        let byte_end = self.offsets[end].to_usize();
+        self.data.delete_range(byte_start, byte_end);
+        self.offsets.delete_range(start, end);
+        if byte_end > byte_start {
+            let delta = T::from_usize(byte_end - byte_start);
+            for offset in &mut self.offsets.as_mut_slice()[start..] {
+                *offset = *offset - delta;
+            }
+        }
+        if let Some(mask) = &mut self.null_mask {
+            mask.delete_range(start, end);
+        }
+    }
+
     fn data(&self) -> &Self::Container {
         &self.data
     }

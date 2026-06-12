@@ -329,6 +329,31 @@ impl Table {
         Ok(BitmaskV::new(ba.data.clone(), 0, ba.len()))
     }
 
+
+    /// Removes the rows in `[start, end)` from every column, shifting later
+    /// rows left.
+    ///
+    /// Columns delete in place through `Vec64::delete_range`.
+    /// Shared columns and shared buffers are cloned first i.e. copy-on-write.
+    ///
+    /// # Panics
+    /// Panics if `start > end` or `end > n_rows`.
+    pub fn delete_range(&mut self, start: usize, end: usize) {
+        assert!(start <= end, "Table::delete_range: start ({start}) > end ({end})");
+        assert!(
+            end <= self.n_rows,
+            "Table::delete_range: end ({end}) > n_rows ({})",
+            self.n_rows
+        );
+        if start == end {
+            return;
+        }
+        for col in &mut self.cols {
+            col.delete_range(start, end);
+        }
+        self.n_rows -= end - start;
+    }
+
     /// Removes a column by name.
     pub fn remove_col(&mut self, name: &str) -> bool {
         if let Some(idx) = self.col_name_index(name) {

@@ -68,6 +68,12 @@ pub trait MaskedArray {
     /// Returns the number of elements in the array.
     fn len(&self) -> usize;
 
+    /// Removes the entries in `[start, end)`, shifting later entries left.
+    ///
+    /// # Panics
+    /// Panics if `start > end` or `end > len`.
+    fn delete_range(&mut self, start: usize, end: usize);
+
     /// Returns true if the array is empty.
     #[inline]
     fn is_empty(&self) -> bool {
