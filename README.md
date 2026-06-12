@@ -209,3 +209,8 @@ Released under the Apache 2.0 License. See [LICENSE](LICENSE) for details.
 Minarrow is a from-scratch implementation of the Apache Arrow memory layout inspired by the standards pioneered by Apache Arrow, Arrow2, and Polars.
 
 Minarrow is not affiliated with Apache Arrow.
+
+## HPC
+Minarrow is backed by SpaceCell, ensuring ongoing support for the project.
+
+For an edge in high-performance data computing, visit [spacecell.com](http://spacecell.com)
