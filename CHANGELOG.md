@@ -5,11 +5,16 @@ All notable changes to **minarrow** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased - 0.13.0
+## 0.13.0
+
 - Added fixed-format ISO 8601 / RFC 3339 timestamp parsing for DatetimeArray
 - Add ArrowType::upcast for binary operation type promotion
 - Added `_into` kernel variants for buffer mutation support.
-- Added LBuffer as experimental backing buffer type
+- Added LBuffer as a backing buffer type
+- Fixed the enum accessors. `num()`, `str()`, `bool()`, `dt()` and the typed
+  accessors (`i32()` through `f64()`, `str32()`, `cat32()`, `dt32()`, etc.) now
+  borrow `&self` and return shared `Arc` handles. This addresses an earlier
+  regression where some APIs unfortunately duplicated impacting architectural clarity.
 
 ## 0.12.1
 
