@@ -27,13 +27,13 @@
 //! - Apache-2.0 Licensed.
 //!
 //! ## Upcoming Additions
-//! 1. **Lightstream-IO** – IPC streaming and Tokio async integration.  
-//! 2. **SIMD Kernels** – Large library of pre-optimised computation kernels.  
+//! 1. **Lightstream-IO** – IPC streaming and Tokio async integration.
+//! 2. **SIMD Kernels** – Large library of pre-optimised computation kernels.
 //!
 //! ## Compatibility
 //! Implements Apache Arrow’s documented memory layouts while simplifying some APIs.
 //! Additional logical types are provided where they add practical value.
-//! Learn more about Apache Arrow at: <https://arrow.apache.org/overview/>.  
+//! Learn more about Apache Arrow at: <https://arrow.apache.org/overview/>.
 //!
 //! Minarrow is not affiliated with Apache Arrow or the Apache Software Foundation.
 //! *Apache Arrow* is a registered trademark of the ASF, referenced under fair use.
@@ -47,7 +47,7 @@
 //!
 //! ## Benchmarks
 //!
-//! **Intel(R) Core(TM) Ultra 7 155H | x86_64 | 22 CPUs**  
+//! **Intel(R) Core(TM) Ultra 7 155H | x86_64 | 22 CPUs**
 //!
 //! ### No SIMD
 //! ***(n=1000, lanes=4, iters=1000)***
@@ -189,7 +189,7 @@ pub mod structs {
     pub mod table;
 }
 
-/// **Shared Memory** - *Sending data over FFI like a Pro? Look here.*
+/// **Shared Memory** - *For sending data to other runtime(s) over FFI.*
 pub mod ffi {
     pub mod arrow_c_ffi;
     pub mod arrow_dtype;

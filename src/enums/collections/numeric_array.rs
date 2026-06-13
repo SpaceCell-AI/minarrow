@@ -120,6 +120,36 @@ impl NumericArray {
         }
     }
 
+    /// Removes the rows in `[start, end)`, shifting later rows left.
+    /// A shared inner array is cloned first i.e. copy-on-write.
+    ///
+    /// # Panics
+    /// Panics if `start > end` or `end > len`.
+    pub fn delete_range(&mut self, start: usize, end: usize) {
+        match self {
+            #[cfg(feature = "extended_numeric_types")]
+            NumericArray::Int8(arr) => arr.delete_range(start, end),
+            #[cfg(feature = "extended_numeric_types")]
+            NumericArray::Int16(arr) => arr.delete_range(start, end),
+            NumericArray::Int32(arr) => arr.delete_range(start, end),
+            NumericArray::Int64(arr) => arr.delete_range(start, end),
+            #[cfg(feature = "extended_numeric_types")]
+            NumericArray::UInt8(arr) => arr.delete_range(start, end),
+            #[cfg(feature = "extended_numeric_types")]
+            NumericArray::UInt16(arr) => arr.delete_range(start, end),
+            NumericArray::UInt32(arr) => arr.delete_range(start, end),
+            NumericArray::UInt64(arr) => arr.delete_range(start, end),
+            NumericArray::Float32(arr) => arr.delete_range(start, end),
+            NumericArray::Float64(arr) => arr.delete_range(start, end),
+            NumericArray::Null => {
+                assert!(
+                    start == 0 && end == 0,
+                    "NumericArray::Null: delete_range out of bounds"
+                );
+            }
+        }
+    }
+
     /// Returns the underlying null mask, if any.
     #[inline]
     pub fn null_mask(&self) -> Option<&Bitmask> {

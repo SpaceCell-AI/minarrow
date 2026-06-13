@@ -602,6 +602,21 @@ impl<T> Buffer<T> {
         vec.splice(range, replace_with)
     }
 
+    /// Removes the elements in `[start, end)`, shifting later elements left.
+    ///
+    /// A shared view is first materialised to an owned `Vec64<T>` i.e.
+    /// copy-on-write, then the delete applies in place. See
+    /// `Vec64::delete_range` for the page-remapping fast path taken on Linux
+    /// with the `vmap64` feature when the deleted byte span is a whole
+    /// multiple of the system page size.
+    ///
+    /// # Panics
+    /// Panics if `start > end` or `end > len`.
+    #[inline]
+    pub fn delete_range(&mut self, start: usize, end: usize) {
+        self.make_owned_mut().delete_range(start, end);
+    }
+
     /// Returns true if the buffer is a shared (zero-copy, externally owned) region.
     #[inline]
     pub fn is_shared(&self) -> bool {

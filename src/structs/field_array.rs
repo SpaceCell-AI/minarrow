@@ -194,6 +194,16 @@ impl FieldArray {
         self.array.len()
     }
 
+    /// Removes the rows in `[start, end)`, shifting later rows left, and
+    /// refreshes the cached null count.
+    ///
+    /// # Panics
+    /// Panics if `start > end` or `end > len`.
+    pub fn delete_range(&mut self, start: usize, end: usize) {
+        self.array.delete_range(start, end);
+        self.null_count = self.array.null_count();
+    }
+
     pub fn is_empty(&self) -> bool {
         self.array.len() == 0
     }

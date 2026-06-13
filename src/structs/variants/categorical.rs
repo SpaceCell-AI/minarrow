@@ -630,6 +630,18 @@ impl<T: Integer> MaskedArray for CategoricalArray<T> {
 
     type CopyType<'a> = &'a str where Self: 'a;
 
+    /// Removes the rows in `[start, end)`, shifting later rows left.
+    /// The dictionary is unchanged: entries left unreferenced remain valid.
+    ///
+    /// # Panics
+    /// Panics if `start > end` or `end > len`.
+    fn delete_range(&mut self, start: usize, end: usize) {
+        self.data.delete_range(start, end);
+        if let Some(mask) = &mut self.null_mask {
+            mask.delete_range(start, end);
+        }
+    }
+
     #[inline]
     fn len(&self) -> usize {
         self.data.len()

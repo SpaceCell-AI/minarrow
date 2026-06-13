@@ -120,6 +120,17 @@ macro_rules! impl_masked_array {
                 &self.data
             }
 
+            /// Removes the rows in `[start, end)`, shifting later rows left.
+            ///
+            /// # Panics
+            /// Panics if `start > end` or `end > len`.
+            fn delete_range(&mut self, start: usize, end: usize) {
+                self.data.delete_range(start, end);
+                if let Some(mask) = &mut self.null_mask {
+                    mask.delete_range(start, end);
+                }
+            }
+
             /// Appends a value to the array.
             #[inline]
             fn push(&mut self, value: T) {
@@ -957,6 +968,9 @@ macro_rules! impl_arc_masked_array {
             fn push(&mut self, value: Self::LogicalType) {
                 ::std::sync::Arc::make_mut(self).push(value)
             }
+            fn delete_range(&mut self, start: usize, end: usize) {
+                ::std::sync::Arc::make_mut(self).delete_range(start, end)
+            }
             unsafe fn push_unchecked(&mut self, value: Self::LogicalType) {
                 unsafe { ::std::sync::Arc::make_mut(self).push_unchecked(value) }
             }
@@ -1080,6 +1094,9 @@ macro_rules! impl_arc_masked_array {
             }
             fn push(&mut self, value: Self::LogicalType) {
                 ::std::sync::Arc::make_mut(self).push(value)
+            }
+            fn delete_range(&mut self, start: usize, end: usize) {
+                ::std::sync::Arc::make_mut(self).delete_range(start, end)
             }
             unsafe fn push_unchecked(&mut self, value: Self::LogicalType) {
                 unsafe { ::std::sync::Arc::make_mut(self).push_unchecked(value) }

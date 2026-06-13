@@ -1083,6 +1083,27 @@ impl Array {
         }
     }
 
+    /// Removes the rows in `[start, end)`, shifting later rows left.
+    /// A shared inner array is cloned first i.e. copy-on-write.
+    ///
+    /// # Panics
+    /// Panics if `start > end` or `end > len`.
+    pub fn delete_range(&mut self, start: usize, end: usize) {
+        match self {
+            Array::NumericArray(arr) => arr.delete_range(start, end),
+            Array::TextArray(arr) => arr.delete_range(start, end),
+            #[cfg(feature = "datetime")]
+            Array::TemporalArray(arr) => arr.delete_range(start, end),
+            Array::BooleanArray(arr) => arr.delete_range(start, end),
+            Array::Null => {
+                assert!(
+                    start == 0 && end == 0,
+                    "Array::Null: delete_range out of bounds"
+                );
+            }
+        }
+    }
+
     /// Returns a metadata view and reference over the specified window of this array.
     ///
     /// Does not slice the object (yet).
