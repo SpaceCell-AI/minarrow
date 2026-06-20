@@ -113,12 +113,25 @@ pub struct BooleanArray<T> {
     /// Optional null mask (bit-packed; 1=valid, 0=null).
     pub null_mask: Option<Bitmask>,
     /// Number of logically populated bits.
-    pub(crate) len: usize,
+    len: usize,
 
     pub _phantom: PhantomData<T>,
 }
 
 impl<T> BooleanArray<T> {
+    /// Constructs a new BoolArray.
+    #[inline]
+    pub fn new(data: Bitmask, null_mask: Option<Bitmask>) -> Self {
+        let len = data.len();
+        validate_null_mask_len(len, &null_mask);
+        Self {
+            data,
+            null_mask,
+            len,
+            _phantom: PhantomData,
+        }
+    }
+
     /// Number of logically populated elements.
     #[inline]
     pub fn len(&self) -> usize {
@@ -137,19 +150,6 @@ impl<T> BooleanArray<T> {
 }
 
 impl BooleanArray<()> {
-    /// Constructs a new BoolArray.
-    #[inline]
-    pub fn new(data: Bitmask, null_mask: Option<Bitmask>) -> Self {
-        let len = data.len();
-        validate_null_mask_len(len, &null_mask);
-        Self {
-            data,
-            null_mask,
-            len,
-            _phantom: PhantomData,
-        }
-    }
-
     /// Constructs a BoolArray with reserved capacity and optional null mask.
     #[inline]
     pub fn with_capacity(cap: usize, null_mask: bool) -> Self {
