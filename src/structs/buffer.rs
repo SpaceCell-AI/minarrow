@@ -145,6 +145,17 @@ enum Storage<T> {
     /// producer continues to grow its storage.
     #[cfg(feature = "lbuffer")]
     LBuffer(LBufferV<T>),
+    /// Non-owning in-place mutable view over an externally owned window.
+    ///
+    /// Reads and writes go straight through the raw pointer with no
+    /// copy-on-write. The window neither frees nor reallocates its memory, so
+    /// growth operations are rejected. The caller owns the backing allocation
+    /// and guarantees it outlives the view and that no other reference aliases
+    /// the same elements.
+    UnsafeMut {
+        ptr: *mut T,
+        len: usize, // element count
+    },
 }
 
 impl<T: Clone> Buffer<T> {
@@ -163,6 +174,32 @@ impl<T> Buffer<T> {
     pub fn from_vec64(v: Vec64<T>) -> Self {
         Self {
             storage: Storage::Owned(v),
+        }
+    }
+
+    /// Construct a non-owning, in-place mutable view over a borrowed window.
+    ///
+    /// Reads and writes act directly on `[ptr, ptr + len)` with no
+    /// copy-on-write. The view never frees or reallocates, so growth operations
+    /// (`push`, `resize`, `reserve`, ...) raise a panic.
+    ///
+    /// This generally should not be used. It exists for the one case where
+    /// several threads each mutate a disjoint window of a single allocation that
+    /// is known to be the sole instance, and presenting each window as an
+    /// ordinary `Buffer<T>` avoids per-window allocation.
+    ///
+    /// # Safety
+    /// The caller guarantees that:
+    /// - `ptr` is valid and writable for `len` elements of `T` for the whole
+    ///   life of the returned buffer.
+    /// - The backing allocation outlives the returned buffer.
+    /// - No other reference reads or writes the same `[ptr, ptr + len)` elements
+    ///   while this buffer is live.
+    /// - `ptr` is aligned for `T`.
+    #[inline]
+    pub unsafe fn from_unsafe_mut(ptr: *mut T, len: usize) -> Self {
+        Self {
+            storage: Storage::UnsafeMut { ptr, len },
         }
     }
 
@@ -439,6 +476,7 @@ impl<T> Buffer<T> {
             Storage::Owned(_) => None,
             #[cfg(feature = "lbuffer")]
             Storage::LBuffer(_) => None,
+            Storage::UnsafeMut { .. } => None,
         }
     }
 
@@ -455,12 +493,20 @@ impl<T> Buffer<T> {
             }
             #[cfg(feature = "lbuffer")]
             Storage::LBuffer(view) => view.as_slice(),
+            Storage::UnsafeMut { ptr, len } => unsafe {
+                std::slice::from_raw_parts(*ptr as *const T, *len)
+            },
         }
     }
 
     /// Returns a mutable slice; will copy on write if buffer is shared.
+    ///
+    /// An `UnsafeMut` view returns its borrowed window in place with no copy.
     #[inline]
     pub fn as_mut_slice(&mut self) -> &mut [T] {
+        if let Storage::UnsafeMut { ptr, len } = self.storage {
+            return unsafe { std::slice::from_raw_parts_mut(ptr, len) };
+        }
         self.make_owned_mut().as_mut_slice()
     }
 
@@ -479,6 +525,7 @@ impl<T> Buffer<T> {
             Storage::Owned(vec) => vec.len(),
             Storage::Shared { len, .. } => *len,
             Storage::LBuffer(view) => view.len(),
+            Storage::UnsafeMut { len, .. } => *len,
         }
     }
 
@@ -534,6 +581,8 @@ impl<T> Buffer<T> {
                 // window length.
                 view.len()
             }
+            // The borrowed window is fixed-size, so its capacity is its length.
+            Storage::UnsafeMut { len, .. } => *len,
         }
     }
     /// Ensure owned and return &mut Vec64<T>.
@@ -542,6 +591,13 @@ impl<T> Buffer<T> {
         // Already owned
         if let Storage::Owned(ref mut vec) = self.storage {
             return vec;
+        }
+
+        // A borrowed window cannot become owned without detaching its writes
+        // from the backing allocation, so any path that needs to grow or
+        // re-own it is a contract violation.
+        if let Storage::UnsafeMut { .. } = self.storage {
+            panic!("Cannot grow or re-own an UnsafeMut buffer window");
         }
 
         // Take the non-owned variant out by replacing with a dummy Owned.
@@ -668,6 +724,16 @@ impl<T> Buffer<T> {
                 let shared = unsafe { SharedBuffer::from_vec64_typed(v) };
                 (shared, 0, len)
             }
+            Storage::UnsafeMut { ptr, len } => {
+                // Snapshot the borrowed window into a fresh Vec64 and freeze it.
+                let mut v = Vec64::with_capacity(len);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(ptr as *const T, v.as_mut_ptr(), len);
+                    v.set_len(len);
+                }
+                let shared = unsafe { SharedBuffer::from_vec64_typed(v) };
+                (shared, 0, len)
+            }
         }
     }
 
@@ -683,6 +749,7 @@ impl<T> Buffer<T> {
             Storage::Owned(_) => None,
             #[cfg(feature = "lbuffer")]
             Storage::LBuffer(_) => None,
+            Storage::UnsafeMut { .. } => None,
         }
     }
 }
@@ -717,6 +784,9 @@ impl<T: Clone> Buffer<T> {
             #[cfg(feature = "lbuffer")]
             Storage::LBuffer(_) => {
                 panic!("split_off is not supported on LBuffer-backed buffers")
+            }
+            Storage::UnsafeMut { .. } => {
+                panic!("split_off is not supported on UnsafeMut buffer windows")
             }
         }
     }
@@ -759,6 +829,10 @@ impl<T: Copy> Buffer<T> {
             }
             #[cfg(feature = "lbuffer")]
             Storage::LBuffer(_) => self.make_owned_mut().truncate(new_len),
+            // Narrow the window in place; the backing allocation is untouched.
+            Storage::UnsafeMut { len, .. } => {
+                *len = new_len;
+            }
         }
     }
 }
@@ -778,6 +852,14 @@ impl<T: Clone> Clone for Buffer<T> {
             Storage::LBuffer(view) => Buffer {
                 storage: Storage::LBuffer(view.clone()),
             },
+            // A clone owns its data so it never aliases the borrowed window.
+            Storage::UnsafeMut { ptr, len } => {
+                let v: Vec64<T> = unsafe { std::slice::from_raw_parts(*ptr as *const T, *len) }
+                    .iter()
+                    .cloned()
+                    .collect();
+                Buffer::from_vec64(v)
+            }
         }
     }
 }
@@ -823,8 +905,11 @@ impl<T> DerefMut for Buffer<T> {
 
     #[inline]
     fn deref_mut(&mut self) -> &mut [T] {
-        match &self.storage {
-            Storage::Owned(_) => self.make_owned_mut(),
+        match &mut self.storage {
+            Storage::Owned(vec) => vec.as_mut_slice(),
+            Storage::UnsafeMut { ptr, len } => unsafe {
+                std::slice::from_raw_parts_mut(*ptr, *len)
+            },
             Storage::Shared { .. } => {
                 // indexing via `&mut buf[0]` still panics
                 panic!("Cannot mutably deref a shared buffer")
@@ -910,6 +995,14 @@ impl<T: Copy> IntoIterator for Buffer<T> {
                 let mut v = Vec64::with_capacity(src.len());
                 unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), v.as_mut_ptr(), src.len()) };
                 unsafe { v.set_len(src.len()) };
+                v.into_iter()
+            }
+            Storage::UnsafeMut { ptr, len } => {
+                let mut v: Vec64<T> = Vec64::with_capacity(len);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(ptr as *const T, v.as_mut_ptr(), len);
+                    v.set_len(len);
+                }
                 v.into_iter()
             }
         }
