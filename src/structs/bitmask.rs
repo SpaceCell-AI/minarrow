@@ -220,6 +220,31 @@ impl Bitmask {
         out
     }
 
+    /// Construct a non-owning, in-place mutable bitmask over a borrowed window.
+    ///
+    /// Reads and writes act directly on the `(len + 7) / 8` bytes at `ptr` with
+    /// no copy-on-write, and the window never frees or reallocates.
+    ///
+    /// This generally should not be used. It exists for the one case where
+    /// several threads each write a disjoint window of a single bit-packed
+    /// allocation that is known to be the sole instance, and presenting each
+    /// window as an ordinary `Bitmask` lets bitmask kernels write it with no
+    /// per-window allocation.
+    ///
+    /// # Safety
+    /// The caller guarantees that:
+    /// - `ptr` is valid and writable for `(len + 7) / 8` bytes for the whole
+    ///   life of the returned bitmask.
+    /// - The backing allocation outlives the returned bitmask.
+    /// - No other reference reads or writes the same bytes while this bitmask is
+    ///   live.
+    #[inline]
+    pub unsafe fn from_unsafe_mut(ptr: *mut u8, len: usize) -> Self {
+        let n_bytes = (len + 7) / 8;
+        let bits = unsafe { Buffer::from_unsafe_mut(ptr, n_bytes) };
+        Self { bits, len }
+    }
+
     /// Returns a ref slice to the raw u8 bytes
     #[inline(always)]
     pub fn as_bytes(&self) -> &[u8] {
@@ -1207,6 +1232,40 @@ impl Shape for Bitmask {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsafe_mut_windows_write_one_allocation() {
+        // One bit-packed allocation of 128 bits, two 64-bit windows over it,
+        // each written through an independent `Bitmask::from_unsafe_mut`.
+        let mut backing = Vec64::<u8>::with_capacity(16);
+        backing.resize(16, 0xFF);
+        let base = backing.as_mut_ptr();
+
+        // Window 0 covers bits [0, 64) i.e. bytes [0, 8); window 1 covers
+        // bits [64, 128) i.e. bytes [8, 16). The windows are byte-disjoint.
+        let mut w0 = unsafe { Bitmask::from_unsafe_mut(base, 64) };
+        let mut w1 = unsafe { Bitmask::from_unsafe_mut(base.add(8), 64) };
+
+        // Each window indexes 0-based and writes through to the backing.
+        w0.set(0, false);
+        w0.set(63, false);
+        w1.set(0, false);
+        w1.set(63, false);
+
+        // Reads through a borrowing window see the backing.
+        assert!(!w0.get(0));
+        assert!(!w0.get(63));
+        assert!(w0.get(1));
+
+        // The single allocation reflects both windows.
+        let whole = Bitmask::new(Buffer::from_slice(&backing[..]), 128);
+        assert!(!whole.get(0));
+        assert!(!whole.get(63));
+        assert!(!whole.get(64));
+        assert!(!whole.get(127));
+        assert!(whole.get(1));
+        assert!(whole.get(64 + 1));
+    }
 
     #[test]
     fn test_bitmask_new_set_get() {
