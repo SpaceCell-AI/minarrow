@@ -268,6 +268,79 @@ pub fn add_months_into<T: Integer + FromPrimitive>(
     }
 }
 
+/// Extract an `i32` calendar field from each value of `src` in the window
+/// `[src_offset, src_offset + out.len())`, writing into `out`. A null input or a
+/// value that is not a representable datetime writes `0` and clears its `out_mask`
+/// bit. The allocating extract methods on `DatetimeArray` pass `src_offset = 0`.
+fn extract_i32_into<T, F>(
+    src: &DatetimeArray<T>,
+    src_offset: usize,
+    out: &mut [i32],
+    mut out_mask: Option<&mut Bitmask>,
+    extract: F,
+) where
+    T: Integer + FromPrimitive,
+    F: Fn(time::OffsetDateTime) -> i32,
+{
+    let time_unit = src.time_unit;
+    for i in 0..out.len() {
+        let dt = if src.is_null(src_offset + i) {
+            None
+        } else {
+            src.data[src_offset + i]
+                .to_i64()
+                .and_then(|v| DatetimeArray::<T>::i64_to_datetime(v, time_unit))
+        };
+        let valid = match dt {
+            Some(dt) => {
+                out[i] = extract(dt);
+                true
+            }
+            None => {
+                out[i] = 0;
+                false
+            }
+        };
+        if let Some(mask) = out_mask.as_deref_mut() {
+            mask.set(i, valid);
+        }
+    }
+}
+
+macro_rules! field_into {
+    ($name:ident, $doc:literal, $extract:expr) => {
+        #[doc = $doc]
+        pub fn $name<T: Integer + FromPrimitive>(
+            src: &DatetimeArray<T>,
+            src_offset: usize,
+            out: &mut [i32],
+            out_mask: Option<&mut Bitmask>,
+        ) {
+            extract_i32_into(src, src_offset, out, out_mask, $extract)
+        }
+    };
+}
+
+field_into!(year_into, "Calendar year of each datetime in the window.", |dt| dt.year());
+field_into!(month_into, "Month (1-12) of each datetime in the window.", |dt| dt.month() as i32);
+field_into!(day_into, "Day of month (1-31) of each datetime in the window.", |dt| dt.day() as i32);
+field_into!(hour_into, "Hour (0-23) of each datetime in the window.", |dt| dt.hour() as i32);
+field_into!(minute_into, "Minute (0-59) of each datetime in the window.", |dt| dt.minute() as i32);
+field_into!(second_into, "Second (0-59) of each datetime in the window.", |dt| dt.second() as i32);
+field_into!(
+    weekday_into,
+    "Weekday (1=Sunday .. 7=Saturday) of each datetime in the window.",
+    |dt| dt.weekday().number_from_sunday() as i32
+);
+field_into!(day_of_year_into, "Day of year (1-366) of each datetime in the window.", |dt| dt.ordinal() as i32);
+field_into!(iso_week_into, "ISO week number (1-53) of each datetime in the window.", |dt| dt.iso_week() as i32);
+field_into!(quarter_into, "Quarter (1-4) of each datetime in the window.", |dt| ((dt.month() as i32 - 1) / 3) + 1);
+field_into!(
+    week_of_year_into,
+    "Week of year (0-53, week 0 holds days before the first Sunday) of each datetime in the window.",
+    |dt| (dt.ordinal() as i32 + 7 - dt.weekday().number_from_sunday() as i32) / 7
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;
