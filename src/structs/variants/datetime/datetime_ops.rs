@@ -563,7 +563,7 @@ impl<T: Integer + FromPrimitive> DatetimeOps for DatetimeArray<T> {
             Some(m) => m.clone(),
             None => Bitmask::new_set_all(len, true),
         };
-        truncate_into(self, period, data.as_mut_slice(), Some(&mut mask));
+        truncate_into(self, 0, period, data.as_mut_slice(), Some(&mut mask));
         let null_mask =
             if self.null_mask.is_some() || mask.has_cleared() { Some(mask) } else { None };
         Self::from_vec64(data, null_mask, Some(self.time_unit))

@@ -41,18 +41,24 @@ use crate::traits::masked_array::MaskedArray;
 use crate::traits::type_unions::Integer;
 use crate::{Bitmask, DatetimeArray};
 
-/// Floor each value of `src` to the start of `period`, writing into `out`.
+/// Floor each value of `src` in the window `[src_offset, src_offset + out.len())` to
+/// the start of `period`, writing into `out`.
+///
+/// `out.len()` rows are processed, reading `src` from `src_offset`. The allocating
+/// `DatetimeArray::truncate` passes `src_offset = 0` over the whole array.
 ///
 /// Handles the full calendar range (`Year` through `Second`, plus `Week`) and the
 /// sub-second steps (`Millisecond`, `Microsecond`). Sub-second steps are no-ops on
 /// arrays whose stored resolution is already at or coarser than the target.
 pub fn truncate_into<T: Integer + FromPrimitive>(
     src: &DatetimeArray<T>,
+    src_offset: usize,
     period: TimePeriod,
     out: &mut [T],
     mut out_mask: Option<&mut Bitmask>,
 ) {
     let time_unit = src.time_unit;
+    let len = out.len();
 
     // Calendar periods floor through a datetime. Sub-second periods divide the raw
     // value instead, since the datetime path cannot express them directly.
@@ -93,10 +99,10 @@ pub fn truncate_into<T: Integer + FromPrimitive>(
     };
 
     if let Some(trunc) = calendar {
-        for i in 0..src.len() {
-            let original = src.data[i];
+        for i in 0..len {
+            let original = src.data[src_offset + i];
             out[i] = original;
-            let valid = if src.is_null(i) {
+            let valid = if src.is_null(src_offset + i) {
                 false
             } else {
                 match original
@@ -129,10 +135,10 @@ pub fn truncate_into<T: Integer + FromPrimitive>(
         (TimePeriod::Millisecond, TimeUnit::Microseconds) => Some(1_000),
         _ => None,
     };
-    for i in 0..src.len() {
-        let original = src.data[i];
+    for i in 0..len {
+        let original = src.data[src_offset + i];
         out[i] = original;
-        let valid = if src.is_null(i) {
+        let valid = if src.is_null(src_offset + i) {
             false
         } else {
             match divisor {
@@ -254,6 +260,39 @@ pub fn add_months_into<T: Integer + FromPrimitive>(
         };
         if let Some(mask) = out_mask.as_deref_mut() {
             mask.set(i, valid);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `truncate_into` reads the source from `src_offset` for the output slice's
+    /// length, leaving rows outside the window untouched. Under the old whole-array
+    /// form this either panicked (writing src.len() rows into a shorter slice) or
+    /// read the wrong rows.
+    #[test]
+    fn truncate_into_respects_source_offset() {
+        const MICROS_PER_DAY: i64 = 86_400_000_000;
+        let vals: [i64; 5] = [
+            1_710_000_000_000_000,
+            1_710_000_007_000_000,
+            1_710_050_000_000_000,
+            1_710_086_400_000_000,
+            1_710_100_000_000_000,
+        ];
+        let src = DatetimeArray::<i64>::from_slice(&vals, Some(TimeUnit::Microseconds));
+        let mut out = [0i64; 3];
+        let mut mask = Bitmask::new_set_all(3, true);
+        truncate_into(&src, 2, TimePeriod::Day, &mut out, Some(&mut mask));
+        for i in 0..3 {
+            assert_eq!(
+                out[i],
+                (vals[2 + i] / MICROS_PER_DAY) * MICROS_PER_DAY,
+                "window row {i} reads src[2 + {i}] and floors to day start"
+            );
+            assert!(mask.get(i));
         }
     }
 }
