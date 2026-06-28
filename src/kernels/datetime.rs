@@ -373,17 +373,45 @@ fn extract_bool_into<T, F>(
     }
 }
 
-/// Whether each datetime in the window falls in a leap year. See [`extract_bool_into`].
-pub fn is_leap_year_into<T: Integer + FromPrimitive>(
-    src: &DatetimeArray<T>,
-    src_offset: usize,
-    out_bits: &mut Bitmask,
-    out_mask: Option<&mut Bitmask>,
-) {
-    extract_bool_into(src, src_offset, out_bits, out_mask, |dt| {
-        time::util::is_leap_year(dt.year())
-    })
+macro_rules! bool_predicate_into {
+    ($name:ident, $doc:literal, $predicate:expr) => {
+        #[doc = $doc]
+        pub fn $name<T: Integer + FromPrimitive>(
+            src: &DatetimeArray<T>,
+            src_offset: usize,
+            out_bits: &mut Bitmask,
+            out_mask: Option<&mut Bitmask>,
+        ) {
+            extract_bool_into(src, src_offset, out_bits, out_mask, $predicate)
+        }
+    };
 }
+
+bool_predicate_into!(
+    is_leap_year_into,
+    "Whether each datetime in the window falls in a leap year.",
+    |dt| time::util::is_leap_year(dt.year())
+);
+bool_predicate_into!(
+    is_month_start_into,
+    "Whether each datetime in the window is the first day of its month.",
+    |dt| dt.day() == 1
+);
+bool_predicate_into!(
+    is_month_end_into,
+    "Whether each datetime in the window is the last day of its month.",
+    |dt| dt.day() == dt.month().length(dt.year())
+);
+bool_predicate_into!(
+    is_year_start_into,
+    "Whether each datetime in the window is the first day of its year.",
+    |dt| dt.month() == time::Month::January && dt.day() == 1
+);
+bool_predicate_into!(
+    is_year_end_into,
+    "Whether each datetime in the window is the last day of its year.",
+    |dt| dt.month() == time::Month::December && dt.day() == 31
+);
 
 #[cfg(test)]
 mod tests {
