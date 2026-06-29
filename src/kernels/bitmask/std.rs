@@ -51,9 +51,7 @@ use crate::{Bitmask, BitmaskVT};
 
 use crate::{
     enums::operators::{LogicalOperator, UnaryOperator},
-    kernels::bitmask::{
-        bitmask_window_bytes, bitmask_window_bytes_mut, clear_trailing_bits,
-    },
+    kernels::bitmask::{bitmask_window_bytes, bitmask_window_bytes_mut},
 };
 
 /// Performs bitwise binary operations (AND/OR/XOR) over two bitmask slices using word-level processing.
@@ -504,6 +502,7 @@ pub fn all_false_mask(mask: &Bitmask) -> bool {
 mod tests {
     use super::*;
     use crate::Bitmask;
+    use crate::kernels::bitmask::clear_trailing_bits;
 
     // Helper: Create a Bitmask from a bool slice.
     fn bm(bits: &[bool]) -> Bitmask {

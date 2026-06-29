@@ -56,7 +56,9 @@ use num_traits::FromPrimitive;
 #[cfg(feature = "datetime_ops")]
 use ::vec64::Vec64;
 #[cfg(feature = "datetime_ops")]
-use crate::kernels::datetime::{add_duration_into, add_months_into, truncate_into};
+use crate::kernels::datetime::{
+    add_duration_into, add_months_into, diff_into, is_leap_year_into, truncate_into,
+};
 
 #[cfg(feature = "datetime_ops")]
 impl<T: Integer + FromPrimitive> DatetimeArray<T> {
@@ -126,7 +128,7 @@ impl<T: Integer + FromPrimitive> DatetimeOps for DatetimeArray<T> {
             Some(m) => m.clone(),
             None => Bitmask::new_set_all(len, true),
         };
-        add_duration_into(self, duration, data.as_mut_slice(), Some(&mut mask))?;
+        add_duration_into(self, 0, duration, data.as_mut_slice(), Some(&mut mask))?;
         let null_mask =
             if self.null_mask.is_some() || mask.has_cleared() { Some(mask) } else { None };
         Ok(Self::from_vec64(data, null_mask, Some(self.time_unit)))
@@ -154,7 +156,7 @@ impl<T: Integer + FromPrimitive> DatetimeOps for DatetimeArray<T> {
             Some(m) => m.clone(),
             None => Bitmask::new_set_all(len, true),
         };
-        add_months_into(self, months, data.as_mut_slice(), Some(&mut mask));
+        add_months_into(self, 0, months, data.as_mut_slice(), Some(&mut mask));
         let null_mask =
             if self.null_mask.is_some() || mask.has_cleared() { Some(mask) } else { None };
         Ok(Self::from_vec64(data, null_mask, Some(self.time_unit)))
@@ -186,35 +188,23 @@ impl<T: Integer + FromPrimitive> DatetimeOps for DatetimeArray<T> {
             });
         }
 
-        let mut result =
-            IntegerArray::with_capacity(self.len(), self.is_nullable() || other.is_nullable());
-
-        for i in 0..self.len() {
-            if self.is_null(i) || other.is_null(i) {
-                result.push_null();
-            } else {
-                let self_dt = self.value_to_datetime(i);
-                let other_dt = other.value_to_datetime(i);
-
-                if let (Some(a), Some(b)) = (self_dt, other_dt) {
-                    let diff_duration = a - b;
-
-                    let diff_value = match unit {
-                        TimeUnit::Seconds => diff_duration.whole_seconds(),
-                        TimeUnit::Milliseconds => diff_duration.whole_milliseconds() as i64,
-                        TimeUnit::Microseconds => diff_duration.whole_microseconds() as i64,
-                        TimeUnit::Nanoseconds => diff_duration.whole_nanoseconds() as i64,
-                        TimeUnit::Days => diff_duration.whole_days(),
-                    };
-
-                    result.push(diff_value);
-                } else {
-                    result.push_null();
-                }
-            }
-        }
-
-        Ok(result)
+        let len = self.len();
+        let mut data = Vec64::<i64>::with_capacity(len);
+        unsafe { data.set_len(len) };
+        let mut mask = match (&self.null_mask, &other.null_mask) {
+            (None, None) => Bitmask::new_set_all(len, true),
+            (Some(a), None) => a.clone(),
+            (None, Some(b)) => b.clone(),
+            (Some(a), Some(b)) => a.intersect(b),
+        };
+        diff_into(self, 0, other, 0, unit, &mut data, Some(&mut mask));
+        let null_mask = if self.null_mask.is_some() || other.null_mask.is_some() || mask.has_cleared()
+        {
+            Some(mask)
+        } else {
+            None
+        };
+        Ok(IntegerArray::from_vec64(data, null_mask))
     }
 
     /// Calculate the absolute duration between elements (always positive).
@@ -533,21 +523,16 @@ impl<T: Integer + FromPrimitive> DatetimeOps for DatetimeArray<T> {
 
     /// Returns boolean array indicating whether each datetime's year is a leap year.
     fn is_leap_year(&self) -> BooleanArray<()> {
-        let mut result = BooleanArray::with_capacity(self.len(), self.is_nullable());
-
-        for i in 0..self.len() {
-            if self.is_null(i) {
-                result.push_null();
-            } else if let Some(dt) = self.value_to_datetime(i) {
-                let year = dt.year();
-                let is_leap = time::util::is_leap_year(year);
-                result.push(is_leap);
-            } else {
-                result.push_null();
-            }
-        }
-
-        result
+        let len = self.len();
+        let mut bits = Bitmask::new_set_all(len, false);
+        let mut mask = match &self.null_mask {
+            Some(m) => m.clone(),
+            None => Bitmask::new_set_all(len, true),
+        };
+        is_leap_year_into(self, 0, &mut bits, Some(&mut mask));
+        let null_mask =
+            if self.null_mask.is_some() || mask.has_cleared() { Some(mask) } else { None };
+        BooleanArray::new(bits, null_mask)
     }
 
     // Rounding/Truncating Operations
@@ -563,7 +548,7 @@ impl<T: Integer + FromPrimitive> DatetimeOps for DatetimeArray<T> {
             Some(m) => m.clone(),
             None => Bitmask::new_set_all(len, true),
         };
-        truncate_into(self, period, data.as_mut_slice(), Some(&mut mask));
+        truncate_into(self, 0, period, data.as_mut_slice(), Some(&mut mask));
         let null_mask =
             if self.null_mask.is_some() || mask.has_cleared() { Some(mask) } else { None };
         Self::from_vec64(data, null_mask, Some(self.time_unit))
