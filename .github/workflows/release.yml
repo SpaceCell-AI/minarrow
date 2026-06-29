@@ -1,0 +1,145 @@
+name: Release
+
+# Builds wheels + sdist for minarrow-py and publishes to PyPI via OIDC trusted
+# publishing. Triggered by a published GitHub Release.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  MANIFEST: -m minarrow-py/Cargo.toml
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          # Build inside manylinux container for broad Linux compatibility
+          manylinux: auto
+          rust-toolchain: nightly
+          args: --release --out dist ${{ env.MANIFEST }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-linux-${{ matrix.target }}
+          path: dist
+
+  macos:
+    runs-on: macos-14
+    strategy:
+      matrix:
+        target: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          rust-toolchain: nightly
+          args: --release --out dist ${{ env.MANIFEST }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-macos-${{ matrix.target }}
+          path: dist
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          rust-toolchain: nightly
+          args: --release --out dist ${{ env.MANIFEST }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-windows
+          path: dist
+
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist ${{ env.MANIFEST }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist
+
+  # Audit the compiled extension for source paths
+  audit:
+    name: Binary audit
+    runs-on: ubuntu-latest
+    needs: [linux]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-linux-x86_64
+          path: dist
+      - name: Scan the compiled extension
+        run: |
+          set -euo pipefail
+          wheel=$(ls dist/*.whl | head -1)
+          tmp=$(mktemp -d)
+          unzip -q "$wheel" -d "$tmp"
+          so=$(find "$tmp" -name '*.so' | head -1)
+          echo "Auditing $so"
+          if strings "$so" | grep -nE '/home/|/Users/|/root/'; then
+            echo "::error::real source/build paths leaked into the binary"
+            exit 1
+          fi
+          echo "Exported dynamic symbols:"
+          nm -D --defined-only "$so" 2>/dev/null | awk '{print $3}' | grep -v '^$' | sort -u || true
+          echo "binary audit passed"
+
+  # Manual run -> TestPyPI
+  publish-testpypi:
+    name: Publish to TestPyPI
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    needs: [linux, macos, windows, sdist, audit]
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/project/minarrow/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          packages-dir: dist
+
+  # Published GitHub Release -> real PyPI.
+  publish-pypi:
+    name: Publish to PyPI
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    needs: [linux, macos, windows, sdist, audit]
+    environment:
+      name: pypi
+      url: https://pypi.org/project/minarrow/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist

@@ -1,0 +1,89 @@
+/* SpaceCell brand - navy banner, gold accent, Merriweather serif headings. */
+
+@import url("https://fonts.googleapis.com/css2?family=Merriweather:wght@700&display=swap");
+
+/* Primary and accent variables for components that read them. */
+[data-md-color-primary="custom"] {
+  --md-primary-fg-color:        #001741;
+  --md-primary-fg-color--light: #00205b;
+  --md-primary-fg-color--dark:  #000e28;
+  --md-primary-bg-color:        #ffffff;
+  --md-primary-bg-color--light: #ffffffb3;
+}
+[data-md-color-accent="custom"] {
+  --md-accent-fg-color: #d1980b;
+}
+
+/* Paint the top banner navy. Set here too so it holds regardless of the
+   palette variable resolution. */
+.md-header,
+.md-tabs {
+  background-color: #001741;
+  color: #ffffff;
+}
+
+/* Light scheme - gold links and navy serif headings. */
+[data-md-color-scheme="default"] {
+  --md-typeset-a-color: #b07d08;
+}
+[data-md-color-scheme="default"] .md-typeset h1,
+[data-md-color-scheme="default"] .md-typeset h2,
+[data-md-color-scheme="default"] .md-typeset h3 {
+  color: #001741;
+}
+
+/* Dark scheme - near-black page, brighter gold, light headings. */
+[data-md-color-scheme="slate"] {
+  --md-default-bg-color: #111418;
+  --md-typeset-a-color:  #f0b726;
+  --md-accent-fg-color:  #f0b726;
+}
+
+/* Serif headings, matching the main site. */
+.md-typeset h1,
+.md-typeset h2,
+.md-typeset h3 {
+  font-family: "Merriweather", Georgia, serif;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+/* Size the emblem in the navy header. */
+.md-header__button.md-logo img,
+.md-header__button.md-logo svg {
+  height: 2rem;
+  width: auto;
+}
+
+/* Home-page feature cards: a gold top accent and gold icons. */
+.md-typeset .grid.cards > ul > li {
+  border-top: 2px solid #d1980b;
+}
+.md-typeset .grid.cards .lg svg,
+.md-typeset .grid.cards .lg img {
+  fill: #d1980b;
+}
+
+/* Tighten the badge row under the page title. */
+.md-typeset p > img[src*="img.shields.io"] {
+  margin: 0 0.2rem 0 0;
+  vertical-align: middle;
+}
+
+/* Collapsible right-hand table of contents, one section per category. */
+.md-nav--secondary .toc-collapsible > .md-nav__link::before {
+  content: "\25B8";
+  display: inline-block;
+  margin-right: 0.35rem;
+  color: #d1980b;
+  transition: transform 0.15s ease;
+}
+.md-nav--secondary .toc-collapsible:not(.toc-collapsed) > .md-nav__link::before {
+  transform: rotate(90deg);
+}
+.md-nav--secondary .toc-collapsible.toc-collapsed > nav.md-nav {
+  display: none;
+}
+.md-nav--secondary .toc-collapsible > .md-nav__link {
+  cursor: pointer;
+}

@@ -1,0 +1,12 @@
+# Build the documentation site:
+#   pip install -r docs/requirements.txt
+#   mkdocs serve      # live preview at http://127.0.0.1:8000
+#   mkdocs build      # static site into ./site
+#   mkdocs gh-deploy  # publish to GitHub Pages
+#
+# minarrow itself must be importable in this environment, since the API
+# reference is generated from the compiled module's docstrings.
+# The [imaging] extra pulls Pillow and CairoSVG for the social-card plugin,
+# which also needs the system Cairo and Pango libraries installed.
+mkdocs-material[imaging]>=9.5
+mkdocstrings[python]>=0.25

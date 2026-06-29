@@ -1,0 +1,93 @@
+site_name: Minarrow - Rust <-> Python
+site_description: Minarrow - Fast, SIMD-Ready Arrow for Rust and Python
+site_url: https://minarrow.com/
+repo_url: https://github.com/spacecell/minarrow
+repo_name: spacecell/minarrow
+copyright: Copyright &copy; 2025-2026 SpaceCell Enterprises Ltd
+
+theme:
+  name: material
+  logo: assets/emblem.png
+  favicon: assets/favicon.png
+  features:
+    - navigation.instant
+    - navigation.indexes
+    - navigation.top
+    - navigation.tracking
+    - content.code.copy
+    - content.code.annotate
+    - content.tabs.link
+    - search.suggest
+    - search.highlight
+  palette:
+    - scheme: default
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - scheme: slate
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  font:
+    text: Inter
+    code: JetBrains Mono
+
+extra_css:
+  - stylesheets/brand.css
+
+extra_javascript:
+  - javascripts/toc-collapse.js
+
+plugins:
+  - social:
+      cards_layout_options:
+        background_color: "#001741"
+        color: "#ffffff"
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          options:
+            force_inspection: true
+            filters: ["!^_"]
+            heading_level: 3
+            show_source: false
+            show_root_heading: true
+            show_root_full_path: false
+            members_order: source
+            separate_signature: true
+            show_signature_annotations: true
+            docstring_section_style: spacy
+
+nav:
+  - Home: index.md
+  - Quickstart: quickstart.md
+  - Types & schemas: types.md
+  - Ecosystem interop: interop.md
+  - API reference: api.md
+
+extra:
+  generator: false
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+  - tables
+  - toc:
+      permalink: true
+      toc_depth: 3
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.tabbed:
+      alternate_style: true

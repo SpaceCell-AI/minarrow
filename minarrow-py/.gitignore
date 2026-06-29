@@ -1,0 +1,8 @@
+/target/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# mkdocs build output and social-card cache (regenerated artifacts)
+.cache/
+site/
