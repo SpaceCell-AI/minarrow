@@ -14,7 +14,7 @@
 
 **Highlights**:
 - < 2s compilation times (_0.15s rebuilds_)
-- Rust to Python for 1m rows in under 200ns¹
+- Rust to Python for 1m rows in under 220ns¹
 - Guaranteed 64-byte SIMD alignment
 - Fully-typed throughout
 - Embed Python ML in Rust
@@ -221,8 +221,9 @@ Sum of 1,000 integers, averaged over 1,000 runs¹:
 Minarrow's direct access is within the noise threshold of raw Vec performance whilst maintaining SIMD-compatible alignment.
 
 ### Python Roundtrip
-**Rust to Python¹** 1m rows, 2 columns : *165ns*
-**Python to Rust¹** 1m rows, 2 columns:  *2.8μs*
+- GIL acquisition (uncontended): **53ns**
+- **Rust to Python¹** 1m rows, 2 columns : **165ns**
+- **Python to Rust¹** 1m rows, 2 columns:  **2.5μs**
 
 See `minarrow-pyo3/examples` 
 
