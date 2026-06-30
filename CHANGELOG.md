@@ -5,41 +5,50 @@ All notable changes to **minarrow** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased
-- Added `_into` Datetime kernel variants for efficient non-allocations.
-- Added `_into` Bitmask kernel variants for efficient non-allocations.
-- Added UnsafeMut utility Buffer for handling cross-thread bitpacked writes.
+# Minarrow Rust
+## [0.15.0] - 2026-06-30
 
-## 0.14.0
-- Added `_into` mutable output buffer datetime variants supporting efficient parallelism.
-- Added `TimePeriod` enum consistency for datetime periods with automatic deref on string
-constituents i.e., `week` becomes `TimePeriod::Week` at the call-site.
-- Fixed BitmaskV lifetime.
-- Fixed BooleanArray length visibility.
+### Added
+- `_into` Datetime kernel variants for efficient non-allocations.
+- `_into` Bitmask kernel variants for efficient non-allocations.
+- `UnsafeMut` utility `Buffer` for handling cross-thread bitpacked writes.
 
-## 0.13.0
+### Changed
+- Improved `name` construction ergonomics.
 
-- Added fixed-format ISO 8601 / RFC 3339 timestamp parsing for DatetimeArray
-- Add ArrowType::upcast for binary operation type promotion
-- Added `_into` kernel variants for buffer mutation support.
-- Added LBuffer as a backing buffer type
-- Fixed the enum accessors. `num()`, `str()`, `bool()`, `dt()` and the typed
+## [0.14.0] - 2026-06-20
+
+### Added
+- `_into` mutable output buffer datetime variants supporting efficient parallelism.
+- `TimePeriod` enum consistency for datetime periods with automatic deref on
+  string constituents i.e., `week` becomes `TimePeriod::Week` at the call-site.
+
+### Fixed
+- `BitmaskV` lifetime.
+- `BooleanArray` length visibility.
+
+## [0.13.0] - 2026-06-13
+
+### Added
+- Fixed-format ISO 8601 / RFC 3339 timestamp parsing for `DatetimeArray`.
+- `ArrowType::upcast` for binary operation type promotion.
+- `_into` kernel variants for buffer mutation support.
+- `LBuffer` as a backing buffer type.
+
+### Fixed
+- The enum accessors. `num()`, `str()`, `bool()`, `dt()` and the typed
   accessors (`i32()` through `f64()`, `str32()`, `cat32()`, `dt32()`, etc.) now
   borrow `&self` and return shared `Arc` handles. This addresses an earlier
-  regression where some APIs unfortunately duplicated impacting architectural clarity.
+  regression where some APIs duplicated, impacting architectural clarity.
 
-## 0.12.1
+## [0.12.1] - 2026-05-26
 
 ### Added
 - Ergonomic constructor macros for `Table` `tbl!`, `Matrix` `mat!`, and `SuperTable` `st!`.
 - Add null mask support for existing `Array` `arr!` and `FieldArray` `fa!` constructors.
 - Zero-Copy FFI for the Minarrow `View` types.
 
-## 0.12.0
-
-**IMPORTANT**: This change includes important Null Mask initialisation corrections.
-These alter (correct) the behaviour of initialisation code paths for `with_capacity`
-typed array constructors, and Bitmask `resize`. It is recommended that all users upgrade.
+## [0.12.0] - 2026-05-25
 
 ### Added
 - Shared categorical dictionaries behind the new `shared_dict` feature.

@@ -69,7 +69,7 @@ required-features = ["embed"]
 [build-dependencies]
 pyo3-build-config = "0.23"
 
-# Release profile is optimised, fully stripped, and carries no debug info.
+# Release profile is optimised, stripped, and carries no debug info.
 #
 # Panic stays at the default unwind so pyo3 converts Rust panics into Python exceptions
 # rather than aborting the interpreter.
@@ -82,5 +82,5 @@ debug = false
 overflow-checks = false
 incremental = false
 # Remap every embedded path - local crate, dependencies, and std - to a
-# sanitized form, so no build-machine paths land in the binary.
+# sanitised form, so no build-machine paths land in the binary.
 trim-paths = "all"
